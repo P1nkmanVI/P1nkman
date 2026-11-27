@@ -299,8 +299,17 @@ fn back_list(kind: u32) -> This {
     list
 }
 
+fn default_thin_threads(cores: usize) -> usize {
+    cores.saturating_sub(2).clamp(2, 8)
+}
+
 fn start() {
-    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
+    let cores = std::thread::available_parallelism().map_or(6, |n| n.get());
+    let threads = std::env::var("VICTORY_THIN_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| default_thin_threads(cores))
+        .clamp(1, 32);
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");

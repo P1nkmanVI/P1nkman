@@ -629,7 +629,12 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let cores = std::thread::available_parallelism().map_or(6, |n| n.get());
+        let workers = std::env::var("VICTORY_DSTORAGE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .map_or_else(|| default_dstorage_workers(cores), |n| n.clamp(1, 16));
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -638,7 +643,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(workers = started, cores, "dstorage: workers (VICTORY_DSTORAGE_WORKERS overrides)");
     });
     Some(scheduler)
 }
@@ -772,8 +777,16 @@ pub(crate) mod stream_log {
     }
 }
 
+/// Default DirectStorage worker count scaled to avoid saturating all cores on
+/// 6-core PCs (3 workers on 6C/6T instead of 6).
+fn default_dstorage_workers(cores: usize) -> usize {
+    (cores / 2).clamp(2, 6)
+}
+
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    #[cfg(windows)]
+    victory_gpu::cores::keep_background_thread("dstorage");
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -2551,5 +2564,14 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn default_dstorage_workers_scales_for_six_core_hosts() {
+        assert_eq!(default_dstorage_workers(4), 2);
+        assert_eq!(default_dstorage_workers(6), 3);
+        assert_eq!(default_dstorage_workers(8), 4);
+        assert_eq!(default_dstorage_workers(12), 6);
+        assert_eq!(default_dstorage_workers(16), 6);
     }
 }
