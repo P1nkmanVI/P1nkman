@@ -121,7 +121,6 @@ fn ask(shader: Arc<crate::pipeline::Shader>) {
             use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
             // SAFETY: this thread's own.
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
-            crate::cores::keep_background_on_aux_cores("victory-picked");
             for shader in asks {
                 let yes = shader.programs().is_none_or(|all| all.iter().any(stores_picked));
                 if yes {

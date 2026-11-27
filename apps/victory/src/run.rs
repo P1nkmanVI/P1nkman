@@ -73,6 +73,9 @@ pub fn run(
     drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
+    if let Some(dir) = exe.parent() {
+        victory_hle::set_title_dir(dir);
+    }
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
@@ -175,8 +178,14 @@ pub fn run(
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
+    // The title patches (upscaler picker, render scale) in every build: a
+    // release build left them out with the other aids, and Series S then
+    // took FidelityFX, whose passes do not run here, and lost the card.
+    // First, before any thread started below can read or write the image.
+    #[cfg(windows)]
+    crate::title_patch::apply(&image)?;
     #[cfg(feature = "diagnostics")]
-    diagnostics(&image, &cfg);
+    diagnostics(&image, &cfg)?;
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
@@ -200,7 +209,7 @@ pub fn run(
 /// The debugging aids (README): scheduled stack dumps, watched values and
 /// memory saved on a crash.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
+fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) -> Result<()> {
     victory_loader::dump_stacks_on_schedule();
     victory_loader::profile_on_schedule(victory_hle::frame_phase);
     victory_hle::modules::audio::capture::start();
@@ -223,6 +232,7 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
             })
             .collect(),
     );
+    Ok(())
 }
 
 /// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each

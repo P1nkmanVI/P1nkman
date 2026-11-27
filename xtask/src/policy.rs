@@ -15,7 +15,12 @@ const MAX_FILE_SIZE: usize = 640 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
-    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh", "py",
+    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    // Node scripts we wrote (scripts/bc-png.mjs), as plain to read as the shell scripts.
+    "mjs",
+    // Drawings we wrote (the charts of docs/img): text, under the same checks as any text, so a
+    // picture encoded into one is turned down by its long run.
+    "svg",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -29,11 +34,10 @@ const ALLOWED_NAMES: &[&str] = &[
 ];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
-const EXCEPTIONS: &[(&str, &str)] = &[
-    ("apps/victory/p1nkman.ico", "original project icon"),
-    ("apps/victory/p1nkman.rc", "Windows resource script for the project icon"),
-    ("docs/progresso.gif", "original generated project progress illustration"),
-];
+const EXCEPTIONS: &[(&str, &str)] = &[(
+    "crates/victory-formats/src/bcpack-tables.bin",
+    "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
+)];
 
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
@@ -90,7 +94,7 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
     )
 }
 
-fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
+pub(crate) fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
     let git = |args: &[&str]| -> Result<Option<Vec<String>>> {
         let out = Command::new("git")
             .args(args)
@@ -254,6 +258,15 @@ mod tests {
             !check("a.rs", &vec![b'a'; 600 * 1024]).is_empty(),
             "too big"
         );
+    }
+
+    #[test]
+    fn accepts_a_drawing_and_rejects_a_picture_inside_one() {
+        let chart = b"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 8 8\"><rect width=\"8\" height=\"8\"/></svg>
+";
+        assert!(check("docs/img/chart.svg", chart).is_empty());
+        let picture = format!("<svg><image href=\"data:image/png;base64,{}\"/></svg>", "QUJD".repeat(300));
+        assert!(!check("docs/img/shot.svg", picture.as_bytes()).is_empty());
     }
 
     #[test]

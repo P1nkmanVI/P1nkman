@@ -17,18 +17,17 @@
 
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
 mod barra;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
-#[cfg(windows)]
-mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]
-pub mod cores;
+mod cores;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -39,11 +38,17 @@ pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]
+mod dxc;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod port;
+#[cfg(windows)]
+mod port_journal;
 #[cfg(windows)]
 mod land;
 pub mod list;
@@ -61,8 +66,6 @@ pub mod query;
 pub mod queue;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod replay;
-#[cfg(windows)]
-mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -89,6 +92,8 @@ pub mod timeline;
 #[cfg(windows)]
 pub mod titlewrite;
 #[cfg(windows)]
+pub mod titletime;
+#[cfg(windows)]
 mod upload;
 #[cfg(windows)]
 mod watch;
@@ -110,6 +115,8 @@ pub fn switched(switch: &str) -> Option<bool> {
 pub fn frame_phase() -> u32 {
     copystat::phase()
 }
+#[cfg(windows)]
+pub use host::set_title_dir;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]

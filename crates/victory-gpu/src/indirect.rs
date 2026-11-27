@@ -4,9 +4,8 @@
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So active records are copied and clamped
 //! on the GPU into a device-local scratch buffer, just before execution, by a
-//! compute shader of ours (HLSL compiled by the system's compiler; a 5.1
-//! shader with its root signature inside), leaving the title's argument and
-//! count buffers untouched.
+//! compute shader of ours (HLSL with its root signature inside), leaving
+//! the title's argument and count buffers untouched.
 //!
 //! The scratch buffer is left readable as indirect arguments after a clamp
 //! and stays so until the next clamp into it, which moves it straight back
@@ -33,7 +32,9 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
+#[cfg(test)]
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+#[cfg(test)]
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
@@ -295,55 +296,22 @@ pub(crate) fn amd(device: &ID3D12Device) -> bool {
 
 /// Whether a record that does not fit in what is left of its list's budget
 /// takes the rest, so that every record after it runs empty too
-/// (`VICTORY_INDIRECT_REST=1`; off by default so one oversized record takes
-/// nothing and later valid draws still run).
+/// (`VICTORY_INDIRECT_REST=0`: it takes nothing, and the next one that fits
+/// runs). A list whose budget one garbage record empties loses all its later
+/// draws, and which record that is may differ from frame to frame. The frame
+/// line says how many records a frame are refused.
 fn rest() -> u32 {
-    u32::from(std::env::var("VICTORY_INDIRECT_REST").is_ok_and(|v| v == "1"))
+    u32::from(std::env::var("VICTORY_INDIRECT_REST").map_or(true, |v| v != "0"))
 }
 
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    #[cfg(feature = "diagnostics")]
-    let batched = source == batch::SOURCE;
     let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(
-            source.as_ptr().cast(),
-            source.len(),
-            s!("clamp"),
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                )
-            };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    let bytes = crate::host::compile(source, s!("main"), s!("cs_5_1"))?;
+    // SAFETY: the root signature is inside the shader.
     unsafe {
-        let bytes =
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, &bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -882,6 +850,49 @@ void main() {
         }
     }
 
+    /// The timestamps around our compares (`host::card_pass_time`): a pair
+    /// taken, written around a compare of some pieces and resolved, gives
+    /// the ticks between them once the list has run; a pair handed out
+    /// again since gives nothing.
+    #[test]
+    fn warp_card_stamps_time_a_compare() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let Some(mut stamps) = crate::host::CardStamps::make(&warp.device) else {
+            panic!("the timestamps must be made on WARP");
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECES: u32 = 16;
+        let size = (64usize << 10) * PIECES as usize;
+        let (_now, _, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, _, differs_gpu) = warp.shared_buffer(4 * u64::from(PIECES));
+        let n = stamps.take();
+        // SAFETY: our open list on the harness's direct queue, live buffers,
+        // the compare's own root signature.
+        unsafe {
+            stamps.begin(&warp.list, n);
+            warp.list.SetComputeRootSignature(&compare.root);
+            warp.list.SetPipelineState(&compare.pso);
+            let constants = [0u32, 0, size as u32, PIECES, 0, 1];
+            warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+            warp.list.Dispatch(PIECES, 1, 1);
+            stamps.end(&warp.list, n);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the list has run.
+        assert!(unsafe { stamps.ticks(n) }.is_some(), "the pair gives its ticks");
+        for _ in 0..crate::host::CardStamps::PAIRS {
+            stamps.take();
+        }
+        // SAFETY: as above.
+        assert_eq!(unsafe { stamps.ticks(n) }, None, "a pair handed out again gives nothing");
+    }
+
     /// The compare of copies in the card's memory (`crate::host`), on the
     /// software adapter. Told 1 it flags the pieces whose bytes are not
     /// what was hashed last and leaves the hashes: a piece a shader changed
@@ -959,6 +970,69 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+    }
+
+    /// Compares of some pieces only (`host::heat`, `VICTORY_CARD_COMPARE_HOT`),
+    /// on the software adapter: a pass over hot pieces leaves the stored
+    /// hashes of the others alone, so a later compare of a piece it skipped
+    /// (a cover) still flags what a shader wrote there before; and once every
+    /// piece was looked at, a compare of all finds nothing.
+    #[test]
+    fn warp_a_piece_left_out_of_a_compare_is_flagged_by_a_later_one() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 5;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(4 * u64::from(PIECES));
+        let content: Vec<u8> = (0..size).map(|i| (i * 7 + i / 977) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        // Passes over pieces `first..first + pieces` (their results at their
+        // own dwords), then what `differs` holds (7: not written).
+        let run = |warp: &mut WarpHarness, passes: &[(u32, u32)], mode: u32| -> Vec<u32> {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                for piece in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(piece).write_volatile(7);
+                }
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                for &(first, pieces) in passes {
+                    let constants = [first, 0u32, size as u32, pieces, first * 4, mode];
+                    warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                    warp.list.Dispatch(pieces, 1, 1);
+                }
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            (0..PIECES as usize)
+                .map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+                .map(|d| if d == 7 { 7 } else { d & 1 })
+                .collect()
+        };
+        // SAFETY (each): inside the mapping.
+        let set = |piece: usize, value: u8| unsafe { now_ptr.add(piece * PIECE + 333).write_volatile(value) };
+        // The hashes, whole (as when a copy's hashes are made).
+        run(&mut warp, &[(0, PIECES)], 0);
+        // A submission writes pieces 1 and 3; its compare reads 1 and 2 only.
+        set(1, content[PIECE + 333] ^ 1);
+        set(3, content[3 * PIECE + 333] ^ 1);
+        assert_eq!(run(&mut warp, &[(1, 2)], 2), [7, 1, 0, 7, 7]);
+        // The next writes piece 1 again; its compare reads 1, and a cover of
+        // the pieces left out before (0, 3, 4) runs too.
+        set(1, content[PIECE + 333] ^ 2);
+        assert_eq!(run(&mut warp, &[(0, 1), (1, 1), (3, 2)], 2), [0, 1, 7, 1, 0]);
+        // Every piece looked at since: nothing more.
+        assert_eq!(run(&mut warp, &[(0, PIECES)], 1), [0, 0, 0, 0, 0]);
     }
 
     /// What the passes over copies in the card's memory cost on the card
@@ -2060,10 +2134,11 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
-        if super::host().is_none() {
+        let Some(host) = super::host() else {
             return; // no host GPU here
-        }
-        assert!(super::clamp().is_some());
+        };
+        super::make_for(&host.device).expect("single-record clamp must build");
+        super::make_from(&host.device, super::batch::SOURCE).expect("batched clamp must build");
     }
 
     #[test]
@@ -2605,7 +2680,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     /// left then, and the records as clamped.
     fn four_records_of_a_group(rest: bool) -> Option<(u32, Vec<u32>)> {
         let mut warp = WarpHarness::new()?;
-        let source = SOURCE.replace("REST ?", if rest { "true ?" } else { "false ?" });
+        let source = if rest { SOURCE.to_owned() } else { SOURCE.replace("REST ?", "false ?") };
         let clamp = make_from(&warp.device, &source).expect("the clamp must compile on WARP");
         const KIND_DRAW: u32 = 0;
         const STRIDE: u32 = 16;
@@ -3428,7 +3503,7 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
-        depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
+        _depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
         back: ID3D12Resource,
@@ -3736,7 +3811,7 @@ void work() {
                     heap_pairs,
                     tables,
                     targets,
-                    depth_written,
+                    _depth_written: depth_written,
                     depth_tested,
                     stamps,
                     back,

@@ -118,6 +118,7 @@ pub extern "system" fn CreateWindowExW(
         )
     };
     hook(hwnd);
+    caption(parent, hwnd);
     hwnd
 }
 
@@ -144,7 +145,17 @@ pub extern "system" fn CreateWindowExA(
         )
     };
     hook(hwnd);
+    caption(parent, hwnd);
     hwnd
+}
+
+/// A top-level window starts with this fork's caption, not the title's own
+/// (its code name); the frame counter adds its numbers once frames show.
+fn caption(parent: HWND, hwnd: HWND) {
+    if parent.is_null() && !hwnd.is_null() {
+        // SAFETY: a window this thread just created, and a NUL-terminated text.
+        unsafe { wm::SetWindowTextW(hwnd, w!("P1nkman")) };
+    }
 }
 
 /// A console title sizes its window to its render target (
@@ -549,11 +560,13 @@ mod tests {
             std::ptr::null(),
         );
         assert!(!hwnd.is_null());
-        let mut text = [0u16; 16];
-        // SAFETY: our window; the buffer holds 16 characters.
+        let mut text = [0u16; 32];
+        // SAFETY: our window; the buffer holds 32 characters.
         unsafe {
+            let n = wm::GetWindowTextW(hwnd, text.as_mut_ptr(), 32);
+            assert_eq!(String::from_utf16_lossy(&text[..n as usize]), "P1nkman");
             wm::SetWindowTextW(hwnd, w!("after"));
-            let n = wm::GetWindowTextW(hwnd, text.as_mut_ptr(), 16);
+            let n = wm::GetWindowTextW(hwnd, text.as_mut_ptr(), 32);
             assert_eq!(String::from_utf16_lossy(&text[..n as usize]), "after");
             assert!(!wm::GetPropW(hwnd, TITLE_PROC).is_null());
             wm::DestroyWindow(hwnd);

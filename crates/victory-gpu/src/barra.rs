@@ -81,6 +81,7 @@ pub(crate) fn second(hwnd: HWND, own: &[u16], figures: Figures) {
                     let text = caption(
                         own,
                         f,
+                        (crate::pipeline::making(), crate::shader_cache::counts().1),
                         cpu_pct,
                         process_working_set().unwrap_or(0),
                         FRAMES.load(Relaxed),
@@ -91,6 +92,8 @@ pub(crate) fn second(hwnd: HWND, own: &[u16], figures: Figures) {
                         let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
                         // SAFETY: a window handle and a NUL-terminated text.
                         unsafe {
+                            static ICON: std::sync::Once = std::sync::Once::new();
+                            ICON.call_once(|| crate::host::set_title_icon(HWND(*hwnd as *mut _)));
                             let _ = SetWindowTextW(HWND(*hwnd as *mut _), PCWSTR(wide.as_ptr()));
                         }
                         shown = text;
@@ -110,11 +113,13 @@ fn cpu_share(used_us: u64, over: Duration, processors: u32) -> f64 {
 }
 
 /// O texto da barra.
-fn caption(own: &str, f: &Figures, cpu_pct: f64, ram: u64, frames: u64, up: Duration, without: Option<Duration>) -> String {
+fn caption(own: &str, f: &Figures, shaders: (u64, u64), cpu_pct: f64, ram: u64, frames: u64, up: Duration, without: Option<Duration>) -> String {
     let own = if own.trim().is_empty() { "P1nkman" } else { own.trim() };
     let ram_gb = ram as f64 / (1u64 << 30) as f64;
     let mut text = format!(
-        "{own} | {:.0} FPS {:.1} ms/quadro (pior {:.0} ms) | GPU {:.0}% CPU {:.0}% RAM {:.1} GB | {:.0} draws | quadro {} | ligado há {}",
+        "{own} | Pipelines pendentes: {} | Shaders novos: {} | {:.0} FPS {:.1} ms/quadro (pior {:.0} ms) | GPU fila {:.0}% CPU {:.0}% RAM {:.1} GB | {:.0} draws | quadro {} | ligado há {}",
+        shaders.0,
+        shaders.1,
         f.fps,
         f.ms,
         f.worst_ms,
@@ -215,10 +220,10 @@ mod tests {
 
     #[test]
     fn a_barra_tem_todos_os_numeros() {
-        let text = caption("P1nkman", &figures(), 37.6, 10 << 30, 12345, Duration::from_secs(754), Some(Duration::from_millis(80)));
+        let text = caption("P1nkman", &figures(), (7, 42), 37.6, 10 << 30, 12345, Duration::from_secs(754), Some(Duration::from_millis(80)));
         assert_eq!(
             text,
-            "P1nkman | 12 FPS 81.0 ms/quadro (pior 120 ms) | GPU 45% CPU 38% RAM 10.0 GB | 4713 draws | quadro 12345 | ligado há 12:34"
+            "P1nkman | Pipelines pendentes: 7 | Shaders novos: 42 | 12 FPS 81.0 ms/quadro (pior 120 ms) | GPU fila 45% CPU 38% RAM 10.0 GB | 4713 draws | quadro 12345 | ligado há 12:34"
         );
     }
 
@@ -226,11 +231,11 @@ mod tests {
     fn sem_quadro_aparece_so_depois_de_um_segundo_e_meio() {
         let f = figures();
         let up = Duration::from_secs(3723);
-        let at = |ms| caption("", &f, 0.0, 0, 9, up, Some(Duration::from_millis(ms)));
+        let at = |ms| caption("", &f, (0, 0), 0.0, 0, 9, up, Some(Duration::from_millis(ms)));
         assert!(!at(1400).contains("SEM QUADRO"));
         assert!(at(3200).ends_with("ligado há 1:02:03 | SEM QUADRO há 3.2 s"), "{}", at(3200));
         assert!(at(1400).starts_with("P1nkman | "));
-        assert!(!caption("P1nkman", &f, 0.0, 0, 0, up, None).contains("SEM QUADRO"));
+        assert!(!caption("P1nkman", &f, (0, 0), 0.0, 0, 0, up, None).contains("SEM QUADRO"));
     }
 
     #[test]
