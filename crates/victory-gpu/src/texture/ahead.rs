@@ -205,7 +205,13 @@ fn workers() -> Option<&'static ID3D12CommandQueue> {
             };
             for n in 0..2 {
                 let worker = Worker::new(&host.device, queue.clone()).ok()?;
-                std::thread::Builder::new().name(format!("uploads ahead {n}")).spawn(move || worker.work()).ok()?;
+                std::thread::Builder::new()
+                    .name(format!("uploads ahead {n}"))
+                    .spawn(move || {
+                        crate::cores::keep_background_thread("uploads-ahead");
+                        worker.work()
+                    })
+                    .ok()?;
             }
             Some(Queue(queue))
         })
@@ -273,6 +279,8 @@ impl Worker {
                 job.record(&self.list);
             }
             self.list.Close()?;
+            static AHEAD_WAITED_MAP: AtomicU64 = AtomicU64::new(0);
+            crate::host::wait_for_mappings(&self.queue, &AHEAD_WAITED_MAP);
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
             self.queue.Signal(&self.fence, value)?;
             // (Without an event: this waits.)
