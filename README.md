@@ -24,6 +24,22 @@ Nesta nova base estamos priorizando a continuidade dos testes no **perfil Series
 
 **~80% — estimativa subjetiva do criador**, apresentada como visão geral do andamento. Não é porcentagem de funcionalidades verificadas, de campanha concluída, de compatibilidade nem previsão de prazo. A barra é visual; o valor pode ser alterado em `scripts/gerar-progresso.py` e o GIF regenerado com Pillow.
 
+### 🎯 Roteiro: 20 FPS com qualidade consistente
+
+Meta para as cenas e a configuração de referência, sujeita a medição e validação. Cada etapa será marcada quando seus critérios tiverem evidências reproduzíveis:
+
+- [ ] **Referência:** definir cenas, configuração e medir a versão de comparação.
+- [ ] **Diagnóstico:** identificar os maiores custos de CPU, GPU, memória e sincronização.
+- [ ] **Sombras:** investigar e corrigir os blocos escuros nas cenas de referência.
+- [ ] **Personagem:** investigar e corrigir deformações e manchas em movimento.
+- [ ] **Otimizações:** testar melhorias individualmente, preservando a qualidade visual.
+- [ ] **Validação:** repetir medições e verificar save, controles, áudio e estabilidade.
+- [ ] **Meta:** demonstrar 20 FPS conforme o protocolo das cenas de referência.
+
+O checklist acompanha entregas comprovadas; ele **não calcula** a estimativa de 80% acima. Veja o [roteiro e os critérios](docs/roteiro-20-fps.md), a [issue principal](https://github.com/P1nkmanVI/P1nkman/issues/1) e suas tarefas para colaboradores e agentes.
+
+
+
 ### O que ainda estamos investigando
 
 - Manchas pretas, sombras em blocos, geometria ausente e texturas que chegam tarde.
