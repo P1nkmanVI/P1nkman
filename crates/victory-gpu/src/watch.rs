@@ -286,7 +286,10 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             tally(0, 1);
             tally(1, ((last - first) * (PAGE >> 10)) as u64);
         }
-        let mut pages: Vec<(usize, u16)> = Vec::new();
+        if count == 0 {
+            return Some(Vec::new());
+        }
+        let mut pages: Vec<(usize, u16)> = Vec::with_capacity(count.min(4096));
         for &at in &found[..count] {
             let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
             match pages.last_mut() {
@@ -346,7 +349,10 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         ask_run(&pieces[i..k], &mut asked, &mut written);
         i = k;
     }
-    note_hot(&written);
+    if !written.is_empty() {
+        note_hot(&written);
+    }
+    coalesce_ahead(&mut asked);
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
     j.ahead = asked;
@@ -447,6 +453,7 @@ fn note_hot(written: &[(usize, u16)]) {
 
 fn ask_early(every: std::time::Duration) {
     use std::sync::atomic::Ordering::Relaxed;
+    crate::cores::keep_background_thread("victory-ask-early");
     // So many rounds without a submission's asking: wait for one.
     const IDLE: u32 = 100;
     let mut round = 0u32;
@@ -550,19 +557,27 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
     let mut written = Vec::new();
+    let mut added: Vec<(usize, usize)> = Vec::new();
     for &(start, end) in ranges {
         if start >= end || published(start, end) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        if !ahead_covers(&ahead, first, last)
+            && !added.iter().any(|&(a, b)| a <= first && last <= b)
             && let Some(pages) = kernel_written(first, last)
         {
             written.extend(pages);
-            ahead.push((first, last));
+            added.push((first, last));
         }
     }
-    note_hot(&written);
+    if !added.is_empty() {
+        ahead.extend(added);
+        coalesce_ahead(&mut ahead);
+    }
+    if !written.is_empty() {
+        note_hot(&written);
+    }
     let mut j = journal_mut();
     // A number of its own, and the one this asking stands under: between
     // the two parts another thread may have asked about a range of the
@@ -644,12 +659,38 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 /// pages written since tracking began and the asking that last found each
 /// written, with the number of the asking that stands (as [`writes`] gives
 /// it). `None` if the kernel would have to be asked.
+/// Sorts and merges overlapping or adjacent page ranges so [`ahead_covers`]
+/// can answer with O(log N) binary search instead of scanning linearly on
+/// every `writes`/`asked`/`nothing_new` lookup.
+fn coalesce_ahead(ahead: &mut Vec<(usize, usize)>) {
+    if ahead.len() <= 1 {
+        return;
+    }
+    ahead.sort_unstable();
+    let mut out = 0usize;
+    for i in 1..ahead.len() {
+        let (a, b) = ahead[i];
+        if a <= ahead[out].1 {
+            ahead[out].1 = ahead[out].1.max(b);
+        } else {
+            out += 1;
+            ahead[out] = (a, b);
+        }
+    }
+    ahead.truncate(out + 1);
+}
+
+/// Whether a sorted, coalesced `ahead` slice holds all of `[first, last)`.
+#[inline]
+fn ahead_covers(ahead: &[(usize, usize)], first: usize, last: usize) -> bool {
+    let idx = ahead.partition_point(|&(a, _)| a <= first);
+    idx > 0 && ahead[idx - 1].1 >= last
+}
+
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    ahead_covers(&j.ahead, first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -662,7 +703,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| ahead_covers(&j.ahead, first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -746,7 +787,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !ahead_covers(&j.ahead, first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -2299,32 +2340,60 @@ pub(crate) fn change_over() {
         return;
     }
     let started = std::time::Instant::now();
-    while changes() == now && started.elapsed().as_millis() < 2 {
-        for _ in 0..50 {
-            std::hint::spin_loop();
+    let mut tries = 0u32;
+    while changes() == now {
+        let elapsed_us = started.elapsed().as_micros();
+        if elapsed_us >= 2_000 {
+            break;
         }
+        if tries < 16 {
+            for _ in 0..16 {
+                std::hint::spin_loop();
+            }
+        } else if elapsed_us < 500 {
+            // SAFETY: cooperatively yields to any ready thread on this core.
+            let yielded = unsafe { windows_sys::Win32::System::Threading::SwitchToThread() };
+            if yielded == 0 {
+                for _ in 0..16 {
+                    std::hint::spin_loop();
+                }
+            }
+        } else {
+            // SAFETY: parks briefly instead of burning a core for milliseconds.
+            unsafe { windows_sys::Win32::System::Threading::Sleep(1) };
+        }
+        tries = tries.saturating_add(1);
     }
 }
 
 /// [`changes`], when no change is under way (or one has been for a second).
 fn change_done() -> u64 {
-    let mut tries = 0;
+    let mut tries = 0u32;
     let mut started = None;
     loop {
         let now = changes();
         if now.is_multiple_of(2) {
             return now;
         }
-        tries += 1;
-        if tries < 100 {
+        tries = tries.saturating_add(1);
+        if tries < 32 {
             std::hint::spin_loop();
             continue;
         }
         if started.get_or_insert_with(std::time::Instant::now).elapsed().as_secs() >= 1 {
             return now;
         }
-        // SAFETY: gives the processor to another thread.
-        unsafe { windows_sys::Win32::System::Threading::Sleep(u32::from(tries > 200)) };
+        if tries < 160 {
+            // SAFETY: yields to any ready thread (including below-normal workers)
+            // without hitting the `Sleep(0)` priority-inversion trap.
+            let yielded = unsafe { windows_sys::Win32::System::Threading::SwitchToThread() };
+            if yielded == 0 {
+                std::hint::spin_loop();
+            }
+        } else {
+            // SAFETY: parks for 1 ms while a long remap completes.
+            unsafe { windows_sys::Win32::System::Threading::Sleep(1) };
+        }
     }
 }
 
@@ -4381,5 +4450,23 @@ mod many_askers_tests {
         BITS.clear(511);
         assert!(!BITS.all(300, 700) && BITS.all(300, 511) && BITS.all(512, 700));
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+
+    /// `coalesce_ahead` merges adjacent/overlapping ranges and `ahead_covers`
+    /// matches linear scanning for every sub-range.
+    #[test]
+    fn coalesced_ahead_ranges_cover_exact_spans() {
+        let mut ranges = vec![(20usize, 30usize), (5, 10), (10, 15), (12, 18), (40, 45), (42, 44)];
+        super::coalesce_ahead(&mut ranges);
+        assert_eq!(ranges, vec![(5, 18), (20, 30), (40, 45)]);
+        assert!(super::ahead_covers(&ranges, 5, 18));
+        assert!(super::ahead_covers(&ranges, 8, 14));
+        assert!(super::ahead_covers(&ranges, 20, 30));
+        assert!(super::ahead_covers(&ranges, 41, 45));
+        assert!(!super::ahead_covers(&ranges, 4, 10));
+        assert!(!super::ahead_covers(&ranges, 15, 22));
+        assert!(!super::ahead_covers(&ranges, 18, 20));
+        assert!(!super::ahead_covers(&ranges, 44, 46));
+        assert!(!super::ahead_covers(&[], 0, 1));
     }
 }
