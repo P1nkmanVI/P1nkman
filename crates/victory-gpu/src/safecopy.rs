@@ -21,20 +21,116 @@ std::arch::global_asm!(
     // rcx destination, rdx source, r8 bytes; eax: whether all were copied.
     // A leaf that leaves the stack alone (the two registers it must give
     // back are kept in volatile ones), so a stack walk through it works.
+    // Every memory access stays strictly inside `victory_safe_copy_at..after`.
+    // Small/medium spans (< 4 KiB) use GPR/AVX2 unrolled moves to avoid
+    // `rep movsb` microcode startup latency; >= 4 KiB uses ERMS `rep movsb`.
     "victory_safe_copy:",
     "mov r10, rsi",
     "mov r11, rdi",
+    "test r8, r8",
+    "jz 9f",
+    "victory_safe_copy_at:",
+    "cmp r8, 32",
+    "jae 2f",
+    "cmp r8, 16",
+    "jb 10f",
+    "vmovdqu xmm0, xmmword ptr [rdx]",
+    "vmovdqu xmm1, xmmword ptr [rdx + r8 - 16]",
+    "vmovdqu xmmword ptr [rcx], xmm0",
+    "vmovdqu xmmword ptr [rcx + r8 - 16], xmm1",
+    "jmp 9f",
+    "10:",
+    "cmp r8, 8",
+    "jb 11f",
+    "mov rax, qword ptr [rdx]",
+    "mov r9, qword ptr [rdx + r8 - 8]",
+    "mov qword ptr [rcx], rax",
+    "mov qword ptr [rcx + r8 - 8], r9",
+    "jmp 9f",
+    "11:",
+    "cmp r8, 4",
+    "jb 12f",
+    "mov eax, dword ptr [rdx]",
+    "mov r9d, dword ptr [rdx + r8 - 4]",
+    "mov dword ptr [rcx], eax",
+    "mov dword ptr [rcx + r8 - 4], r9d",
+    "jmp 9f",
+    "12:",
+    "movzx eax, byte ptr [rdx]",
+    "cmp r8, 2",
+    "jb 13f",
+    "movzx r9d, word ptr [rdx + r8 - 2]",
+    "mov byte ptr [rcx], al",
+    "mov word ptr [rcx + r8 - 2], r9w",
+    "jmp 9f",
+    "13:",
+    "mov byte ptr [rcx], al",
+    "jmp 9f",
+    "2:",
+    "cmp r8, 64",
+    "ja 3f",
+    "vmovdqu ymm0, ymmword ptr [rdx]",
+    "vmovdqu ymm1, ymmword ptr [rdx + r8 - 32]",
+    "vmovdqu ymmword ptr [rcx], ymm0",
+    "vmovdqu ymmword ptr [rcx + r8 - 32], ymm1",
+    "jmp 8f",
+    "3:",
+    "cmp r8, 128",
+    "ja 4f",
+    "vmovdqu ymm0, ymmword ptr [rdx]",
+    "vmovdqu ymm1, ymmword ptr [rdx + 32]",
+    "vmovdqu ymm2, ymmword ptr [rdx + r8 - 64]",
+    "vmovdqu ymm3, ymmword ptr [rdx + r8 - 32]",
+    "vmovdqu ymmword ptr [rcx], ymm0",
+    "vmovdqu ymmword ptr [rcx + 32], ymm1",
+    "vmovdqu ymmword ptr [rcx + r8 - 64], ymm2",
+    "vmovdqu ymmword ptr [rcx + r8 - 32], ymm3",
+    "jmp 8f",
+    "4:",
+    "cmp r8, 4096",
+    "jae 6f",
+    "5:",
+    "vmovdqu ymm0, ymmword ptr [rdx]",
+    "vmovdqu ymm1, ymmword ptr [rdx + 32]",
+    "vmovdqu ymm2, ymmword ptr [rdx + 64]",
+    "vmovdqu ymm3, ymmword ptr [rdx + 96]",
+    "vmovdqu ymmword ptr [rcx], ymm0",
+    "vmovdqu ymmword ptr [rcx + 32], ymm1",
+    "vmovdqu ymmword ptr [rcx + 64], ymm2",
+    "vmovdqu ymmword ptr [rcx + 96], ymm3",
+    "add rdx, 128",
+    "add rcx, 128",
+    "sub r8, 128",
+    "cmp r8, 128",
+    "ja 5b",
+    "vmovdqu ymm0, ymmword ptr [rdx + r8 - 128]",
+    "vmovdqu ymm1, ymmword ptr [rdx + r8 - 96]",
+    "vmovdqu ymm2, ymmword ptr [rdx + r8 - 64]",
+    "vmovdqu ymm3, ymmword ptr [rdx + r8 - 32]",
+    "vmovdqu ymmword ptr [rcx + r8 - 128], ymm0",
+    "vmovdqu ymmword ptr [rcx + r8 - 96], ymm1",
+    "vmovdqu ymmword ptr [rcx + r8 - 64], ymm2",
+    "vmovdqu ymmword ptr [rcx + r8 - 32], ymm3",
+    "jmp 8f",
+    "6:",
     "mov rdi, rcx",
     "mov rsi, rdx",
     "mov rcx, r8",
-    "victory_safe_copy_at:",
     "rep movsb",
     "victory_safe_copy_after:",
+    "9:",
+    "mov eax, 1",
+    "mov rsi, r10",
+    "mov rdi, r11",
+    "ret",
+    "8:",
+    "vzeroupper",
     "mov eax, 1",
     "mov rsi, r10",
     "mov rdi, r11",
     "ret",
     "victory_safe_copy_failed:",
+    "vzeroupper",
     "xor eax, eax",
     "mov rsi, r10",
     "mov rdi, r11",
@@ -56,9 +152,14 @@ std::arch::global_asm!(
     "vmovmskps eax, ymm2",
     "cmp eax, 255",
     "je 3f",
-    "vpxor ymm2, ymm2, ymm3",
     "victory_safe_put_at:",
+    "test eax, eax",
+    "jz 5f",
+    "vpxor ymm2, ymm2, ymm3",
     "vpmaskmovd ymmword ptr [rcx], ymm2, ymm1",
+    "jmp 3f",
+    "5:",
+    "vmovdqu ymmword ptr [rcx], ymm1",
     "victory_safe_put_after:",
     "nop",
     "3:",
@@ -395,7 +496,10 @@ mod tests {
         assert!(on());
         let (a, b) = (Pages::new(1 << 16), Pages::new(1 << 16));
         a.fill();
-        for len in [0usize, 1, 3, 4, 8, 31, 64, 255, 4095, 4096, 4097, 60_000] {
+        for len in [
+            0usize, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65,
+            96, 127, 128, 129, 192, 255, 256, 257, 512, 1024, 2048, 4095, 4096, 4097, 60_000,
+        ] {
             for (da, sa) in [(0usize, 0usize), (1, 0), (0, 3), (5, 2)] {
                 // SAFETY: inside the two allocations.
                 unsafe {
@@ -700,8 +804,14 @@ mod tests {
             assert!(!copy(b.0, a.0, b.1));
             VirtualProtect(b.0.add(4096).cast(), 4096, PAGE_READONLY, &mut old);
             assert!(!copy(b.0, a.0, 8192));
+            // Fault across the protected boundary in every GPR/AVX2/ERMS size bucket.
+            for len in [2usize, 4, 8, 16, 32, 64, 128, 256, 1024, 4096] {
+                let start = 4096 - (len / 2);
+                assert!(!copy(b.0.add(start), a.0.add(start), len), "dst fault len={len}");
+            }
             assert!(!copy(std::ptr::without_provenance_mut(0x10), a.0, 4));
             assert!(!copy(b.0, std::ptr::without_provenance(usize::MAX - 7), 4));
+            assert!(!copy(b.0, std::ptr::without_provenance(usize::MAX - 7), 256));
             VirtualProtect(b.0.add(4096).cast(), 4096, PAGE_READWRITE, &mut old);
         }
         // Many faults, on several threads at once.
