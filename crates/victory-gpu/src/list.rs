@@ -155,7 +155,24 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     let started = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    let timed = crate::titletime::list_call();
+    // A list's lock another thread holds is waited for, and timed with
+    // `VICTORY_TITLE_TIME` (only when the try fails: nothing more per call).
+    let mut held = match state.try_lock() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let began = crate::titletime::now();
+            let held = state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(began) = began {
+                crate::titletime::add(crate::titletime::Kind::ListLock, began.elapsed().as_nanos() as u64);
+            }
+            held
+        }
+    };
+    f(list, &mut held);
+    drop(held);
+    drop(timed);
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
 }
@@ -204,10 +221,16 @@ impl Detached {
         &self.host
     }
 
-    /// Releases this list's dynamic descriptor slots once its GPU submission
-    /// has completed, without waiting for the full `bury_lag` allocator delay.
+    /// The list's submission has run: its dynamic descriptor slots are
+    /// given back now, not when the list is dropped, which waits for many
+    /// submissions more (`VICTORY_BURY_LAG`, 64). Held so long they ran out
+    /// in heavy frames ("no free dynamic descriptor slots: a table is not
+    /// made", and the draw goes without it). After Belobug's e9428969.
+    /// On by default; `VICTORY_LANDED_TABLES=0` keeps them until the drop.
     pub(crate) fn release_tables(&mut self) {
-        self._state.tables_done();
+        if crate::toggled!("VICTORY_LANDED_TABLES") {
+            self._state.tables_done();
+        }
     }
 }
 
@@ -896,6 +919,103 @@ fn unlike(dst: This, src: This) -> bool {
     unlike
 }
 
+/// A texture's shape for [`clip_to_destination`]: its DXGI format,
+/// width, height, depth or array size, levels and whether it is 3D.
+#[derive(Clone, Copy, Debug)]
+struct Shape {
+    format: u32,
+    width: u64,
+    height: u32,
+    depth_or_array: u32,
+    levels: u32,
+    volume: bool,
+}
+
+impl Shape {
+    /// The width, height and depth of subresource `sub`, in texels.
+    fn level(&self, sub: u32) -> [u64; 3] {
+        let level = sub % self.levels.max(1);
+        let depth = if self.volume { (u64::from(self.depth_or_array) >> level).max(1) } else { 1 };
+        [
+            (self.width >> level).max(1),
+            (u64::from(self.height) >> level).max(1),
+            depth,
+        ]
+    }
+}
+
+/// Whether a texture to texture copy whose region does not fit its
+/// destination level is cut to what fits (`VICTORY_COPY_CLIP=0`: passed
+/// on whole, as before; default on). The title compresses its baked
+/// decorations block by block into a 32x32 R32G32_UINT (BC1) or
+/// R32G32B32A32_UINT (BC3, BC7) scratch texture for every level of the
+/// result and copies the whole scratch, with no box, into each level of
+/// the block-compressed texture, the 16x16, 8x8, 4x4 and 2x2 block levels
+/// too. The console cuts such a copy to the destination; the host's is
+/// then invalid and those levels kept whatever title memory held when the
+/// texture was first uploaded: other textures' bytes, a colour that
+/// differs from run to run where a character's skin is seen from a few
+/// metres (the prison guard's tattooed arm).
+fn copy_clip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_CLIP").is_none_or(|v| v != "0"))
+}
+
+/// The source box of a texture to texture copy of `source`'s subresource
+/// `src_sub` (`source_box`, `None` for all of it) into `destination`'s
+/// `dst_sub` at `at`, cut to what fits that level: `Some(None)` when it
+/// fits as it is, `Some(Some(box))` cut, `None` when nothing fits. Sizes
+/// are compared in elements (blocks of a block-compressed format, texels
+/// of another), as the host copies between a compressed format and an
+/// uncompressed one of the block's size: one texel to one block.
+fn clip_to_destination(
+    destination: Shape,
+    dst_sub: u32,
+    at: [u32; 3],
+    source: Shape,
+    src_sub: u32,
+    source_box: Option<[u32; 6]>,
+) -> Option<Option<[u32; 6]>> {
+    let (Some((_, to_block)), Some((_, from_block))) = (
+        crate::resource::element(destination.format),
+        crate::resource::element(source.format),
+    ) else {
+        return Some(source_box);
+    };
+    let to_level = destination.level(dst_sub);
+    let from_level = source.level(src_sub);
+    // (Depth is never in blocks.)
+    let to_blocks = [to_block, to_block, 1];
+    let from_blocks = [from_block, from_block, 1];
+    let whole = [0, 0, 0, from_level[0] as u32, from_level[1] as u32, from_level[2] as u32];
+    let given = source_box.unwrap_or(whole);
+    let mut cut = given;
+    for axis in 0..3 {
+        // Elements of the destination level from the corner on.
+        let room = to_level[axis]
+            .div_ceil(to_blocks[axis])
+            .saturating_sub(u64::from(at[axis]) / to_blocks[axis]);
+        if room == 0 {
+            return None;
+        }
+        let (start, end) = (u64::from(given[axis]), u64::from(given[axis + 3]));
+        let elements = end.saturating_sub(start).div_ceil(from_blocks[axis]);
+        if elements > room {
+            // The source's own level edge stays the end where it comes first
+            // (a block-compressed level smaller than a block).
+            cut[axis + 3] = (start + room * from_blocks[axis]).min(from_level[axis]) as u32;
+        }
+    }
+    Some((cut != given).then_some(cut).or(source_box))
+}
+
+/// Texture to texture copies cut to their destination level
+/// ([`clip_to_destination`]) and those left out because nothing of them
+/// fit, since the start.
+#[cfg(windows)]
+pub(crate) static CLIPPED_COPIES: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
 /// Copies left out because both sides were one host texture
 /// ([`copy_resource`], [`copy_texture_region`]), since the start.
 #[cfg(windows)]
@@ -1045,6 +1165,8 @@ extern "system" fn copy_texture_region(
         let mut from = src;
         // Both sides are the same subresource of one host texture (set below).
         let mut same = false;
+        // The source texture's host description, for `clip_to_destination`.
+        let mut source_desc = None;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
@@ -1095,6 +1217,10 @@ extern "system" fn copy_texture_region(
             }
             if !same {
                 ensure_state(list, src.resource, COPY_SOURCE);
+            }
+            if copy_clip() && dst.kind != FOOTPRINT {
+                // SAFETY: a live resource.
+                source_desc = Some(unsafe { texture.GetDesc() });
             }
             from.resource = texture.as_raw().cast_const().cast();
         }
@@ -1147,14 +1273,83 @@ extern "system" fn copy_texture_region(
         ensure_state(list, dst.resource, COPY_DEST);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        let mut host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        // A region larger than the destination level, cut to it
+        // (`copy_clip`); the cut box lives until the copy is recorded.
+        let mut cut_box = None;
+        if let Some(from_desc) = source_desc {
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+            };
+            let shape = |d: &D3D12_RESOURCE_DESC| Shape {
+                format: d.Format.0 as u32,
+                width: d.Width,
+                height: d.Height,
+                depth_or_array: u32::from(d.DepthOrArraySize),
+                levels: u32::from(d.MipLevels),
+                volume: d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+            };
+            // SAFETY: a live texture; the box is the title's or null.
+            let (to_desc, given) = unsafe {
+                (to.GetDesc(), host_box.map(|b| b.cast::<[u32; 6]>().read_unaligned()))
+            };
+            let clipped = clip_to_destination(
+                shape(&to_desc),
+                dst.footprint.offset as u32,
+                [x, y, z],
+                shape(&from_desc),
+                src.footprint.offset as u32,
+                given,
+            );
+            let counted = |i: usize| {
+                let n = CLIPPED_COPIES[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    tracing::info!(
+                        copies = n,
+                        destination = format_args!(
+                            "{}x{} f{} sub {}",
+                            to_desc.Width,
+                            to_desc.Height,
+                            to_desc.Format.0,
+                            dst.footprint.offset as u32
+                        ),
+                        at = ?[x, y, z],
+                        source = format_args!(
+                            "{}x{} f{} sub {}",
+                            from_desc.Width,
+                            from_desc.Height,
+                            from_desc.Format.0,
+                            src.footprint.offset as u32
+                        ),
+                        given = ?given,
+                        cut = ?clipped,
+                        "a texture copy larger than its destination level was {}",
+                        if i == 0 { "cut to it" } else { "left out: nothing of it fits" }
+                    );
+                }
+            };
+            match clipped {
+                None => {
+                    counted(1);
+                    return;
+                }
+                Some(Some(b)) if Some(b) != given => {
+                    counted(0);
+                    cut_box = Some(b);
+                }
+                _ => {}
+            }
+        }
+        if let Some(b) = &cut_box {
+            host_box = Some(std::ptr::from_ref(b).cast::<D3D12_BOX>());
+        }
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
                 // SAFETY: a live texture; the box is the title's or null.
                 let (d, b) = unsafe { (to.GetDesc(), host_box.map(|b| *b)) };
                 format!(
-                    "copy to {:?} {}x{} f{} sub/kind {} at {x},{y},{z} from {:?} kind {} footprint {:?} box {b:?}",
+                    "copy to {:?} {}x{} f{} sub/kind {} at {x},{y},{z} from {:?} kind {} footprint {:?} box {b:?} subresources {} from {}",
                     dst.resource,
                     d.Width,
                     d.Height,
@@ -1162,7 +1357,11 @@ extern "system" fn copy_texture_region(
                     dst.kind,
                     src.resource,
                     src.kind,
-                    (src.kind == FOOTPRINT).then_some(src.footprint)
+                    (src.kind == FOOTPRINT).then_some(src.footprint),
+                    // (Last, for readers of the older lines: the levels the
+                    // "sub/kind" above never showed.)
+                    dst.footprint.offset as u32,
+                    src.footprint.offset as u32
                 )
             };
             match read {
@@ -2133,16 +2332,127 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
+/// One of the title's barrier groups, laid out as the PC's
+/// `D3D12_BARRIER_GROUP`: the kind of its barriers (0 global, 1 texture,
+/// 2 buffer), how many, and where they are.
+#[repr(C)]
+struct Group {
+    kind: u32,
+    count: u32,
+    barriers: *const u8,
+}
+
+/// What the barriers of a call say of unordered access (what shaders write).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GroupWrites {
+    /// A barrier ends an unordered access: what shaders wrote is used next.
+    /// Also what is not understood (a kind unknown, no groups given).
+    Ended,
+    /// Unordered access only begins.
+    Begun,
+    /// Other accesses and layouts alone.
+    Other,
+}
+
+/// Each barrier of the groups as `(kind, [sync before, sync after, access
+/// before, access after])`: barriers of all kinds begin with those four
+/// (16, 64 and 40 bytes a global, texture and buffer barrier). `false` if
+/// a group is not one of those kinds, and nothing more is read.
+///
+/// # Safety
+/// `groups` holds `count` groups of the title, live for the call.
+unsafe fn group_barriers(groups: *const u8, count: u32, mut each: impl FnMut(u32, [u32; 4])) -> bool {
+    const SIZES: [usize; 3] = [16, 64, 40];
+    if groups.is_null() {
+        return false;
+    }
+    // SAFETY: the caller's.
+    let groups = unsafe { std::slice::from_raw_parts(groups.cast::<Group>(), count as usize) };
+    for g in groups {
+        let Some(&size) = SIZES.get(g.kind as usize) else { return false };
+        if g.count > 0 && g.barriers.is_null() {
+            return false;
+        }
+        for i in 0..g.count as usize {
+            // SAFETY: `count` barriers of that size, each beginning with four 32-bit values.
+            each(g.kind, unsafe { g.barriers.add(i * size).cast::<[u32; 4]>().read_unaligned() });
+        }
+    }
+    true
+}
+
+/// What the groups say of unordered access ([`GroupWrites`]).
+///
+/// # Safety
+/// As [`group_barriers`].
+unsafe fn group_writes(groups: *const u8, count: u32) -> GroupWrites {
+    const UNORDERED: u32 = 0x10;
+    let mut found = GroupWrites::Other;
+    // SAFETY: the caller's.
+    let known = unsafe {
+        group_barriers(groups, count, |_, [_, _, before, after]| {
+            if before & UNORDERED != 0 {
+                found = GroupWrites::Ended;
+            } else if after & UNORDERED != 0 && found == GroupWrites::Other {
+                found = GroupWrites::Begun;
+            }
+        })
+    };
+    if known { found } else { GroupWrites::Ended }
+}
+
+/// Which of the title's barrier groups record a wait for every earlier
+/// shader write (`VICTORY_GROUP_WAITS`): `all` of them (unset: as it was),
+/// `named` (the groups that name unordered access, before or after), or
+/// `ended` (only the groups that end one). With `VICTORY_AB` naming the
+/// switch (diagnostics builds): `all` in its phases on, `ended` in the others.
+#[cfg(windows)]
+fn group_waits(writes: GroupWrites) -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static BIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        if let Some(bit) = *BIT.get_or_init(|| crate::ab::bit("VICTORY_GROUP_WAITS")) {
+            return crate::ab::on(bit) || writes == GroupWrites::Ended;
+        }
+    }
+    static SET: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| match std::env::var("VICTORY_GROUP_WAITS").as_deref() {
+        Ok("named") => 1,
+        Ok("ended") => 2,
+        _ => 0,
+    });
+    match set {
+        0 => true,
+        1 => writes != GroupWrites::Other,
+        _ => writes == GroupWrites::Ended,
+    }
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
+    // SAFETY: the title's groups, for this call.
+    #[cfg(windows)]
+    let writes = unsafe { group_writes(groups, count) };
+    // Diagnostics: counted by what they say, and left out under
+    // `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
-        crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+        use crate::copystat::C;
+        crate::copystat::add(C::WaitsForGroups, 1);
+        crate::copystat::add(
+            match writes {
+                GroupWrites::Ended => C::GroupsEndWrites,
+                GroupWrites::Begun => C::GroupsBeginWrites,
+                GroupWrites::Other => C::GroupsOther,
+            },
+            1,
+        );
+        // SAFETY: as above.
+        unsafe { group_barriers(groups, count, crate::copystat::group_barrier) };
         if crate::copystat::barrier_test() & 1 != 0 {
             return;
         }
@@ -2153,13 +2463,16 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         with_state(this, |_, state| state.synced());
+        if !group_waits(writes) {
+            return;
+        }
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, count, groups);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -2382,6 +2695,63 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A 2D texture's [`Shape`].
+    fn flat(format: u32, side: u32, levels: u32) -> Shape {
+        Shape {
+            format,
+            width: u64::from(side),
+            height: side,
+            depth_or_array: 1,
+            levels,
+            volume: false,
+        }
+    }
+
+    #[test]
+    fn a_compression_scratch_is_cut_to_the_level_it_is_copied_into() {
+        // The decoration bake's BC1 result (128x128, 8 levels) and its
+        // 32x32 R32G32_UINT scratch, copied whole into every level.
+        let bc1 = flat(71, 128, 8);
+        let scratch = flat(17, 32, 1);
+        // Level 0: 32x32 blocks, it fits.
+        assert_eq!(clip_to_destination(bc1, 0, [0; 3], scratch, 0, None), Some(None));
+        // Level 1 (64x64 texels, 16x16 blocks) and level 5 (4x4 texels, a
+        // block): only that many scratch texels.
+        assert_eq!(
+            clip_to_destination(bc1, 1, [0; 3], scratch, 0, None),
+            Some(Some([0, 0, 0, 16, 16, 1]))
+        );
+        assert_eq!(
+            clip_to_destination(bc1, 5, [0; 3], scratch, 0, None),
+            Some(Some([0, 0, 0, 1, 1, 1]))
+        );
+        // Levels smaller than a block take one: a 1x1 scratch fits as it is.
+        let one = flat(17, 1, 1);
+        assert_eq!(clip_to_destination(bc1, 7, [0; 3], one, 0, None), Some(None));
+        // A box of its own is cut the same way; one that fits is kept.
+        let given = Some([0, 0, 0, 66, 66, 1]);
+        assert_eq!(
+            clip_to_destination(flat(71, 4224, 1), 0, [0, 528, 0], flat(17, 66, 1), 0, given),
+            Some(given)
+        );
+        assert_eq!(
+            clip_to_destination(bc1, 2, [16, 0, 0], scratch, 0, given),
+            Some(Some([0, 0, 0, 4, 8, 1]))
+        );
+        // Nothing fits past the level's edge.
+        assert_eq!(clip_to_destination(bc1, 2, [32, 0, 0], scratch, 0, None), None);
+        // Block-compressed to block-compressed: the source's own edge.
+        let small = flat(71, 8, 2);
+        assert_eq!(
+            clip_to_destination(flat(71, 4, 1), 0, [0; 3], small, 1, None),
+            Some(None)
+        );
+        assert_eq!(
+            clip_to_destination(flat(71, 4, 1), 0, [0; 3], small, 0, None),
+            Some(Some([0, 0, 0, 4, 4, 1]))
+        );
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

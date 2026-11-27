@@ -150,10 +150,10 @@ pub(crate) extern "system" fn wait(
     }
     let _called = crate::timeline::span("the title's frame wait");
     let hr = if wait > limit {
-        pace_sleep(limit);
+        std::thread::sleep(limit);
         TIMEOUT
     } else {
-        pace_sleep(wait);
+        std::thread::sleep(wait);
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
@@ -184,36 +184,6 @@ pub(crate) extern "system" fn wait(
         "frame wait"
     );
     hr
-}
-
-/// Sleeps for `dur` without pointless `Sleep(0)` kernel transitions on late
-/// frames (`dur == 0`) or zero-timeout polls, and without busy-spinning on
-/// millisecond waits. For tiny sub-millisecond waits (`0 < dur < 1 ms`),
-/// yields cooperatively (`SwitchToThread`) so ready threads on 6-core CPUs
-/// are never starved.
-fn pace_sleep(dur: Duration) {
-    if dur.is_zero() {
-        return;
-    }
-    if dur >= Duration::from_millis(1) {
-        std::thread::sleep(dur);
-        return;
-    }
-    let deadline = Instant::now() + dur;
-    while Instant::now() < deadline {
-        #[cfg(windows)]
-        {
-            // SAFETY: cooperative yield to any ready thread on this core.
-            let yielded = unsafe { windows_sys::Win32::System::Threading::SwitchToThread() };
-            if yielded == 0 {
-                for _ in 0..16 {
-                    std::hint::spin_loop();
-                }
-            }
-        }
-        #[cfg(not(windows))]
-        std::thread::yield_now();
-    }
 }
 
 /// Device method: no statistics are kept, so none are returned.
@@ -291,14 +261,5 @@ mod tests {
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);
-    }
-
-    #[test]
-    fn pace_sleep_zero_returns_without_blocking() {
-        let began = Instant::now();
-        for _ in 0..100 {
-            pace_sleep(Duration::ZERO);
-        }
-        assert!(began.elapsed() < Duration::from_millis(50));
     }
 }
