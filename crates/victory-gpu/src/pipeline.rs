@@ -162,13 +162,22 @@ impl Shader {
                 let done = translate(&self.container);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
-                if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
+                // `VICTORY_SHADER_SAVE_HASHES` optionally restricts capture to a comma-separated
+                // list of content hashes, keeping diagnostic captures small.
+                if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE")
+                    && shader_save_selected(&self.hash)
+                {
                     let dir = std::path::PathBuf::from(dir);
-                    let _ = std::fs::create_dir_all(&dir);
                     let stem = format!("{}.{}", self.hash, self.stage);
-                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
+                    if let Err(error) = std::fs::create_dir_all(&dir) {
+                        tracing::warn!(path = %dir.display(), %error, "could not create shader capture directory");
+                    } else if let Err(error) = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container) {
+                        tracing::warn!(path = %dir.join(format!("{stem}.cdxil")).display(), %error, "could not save original shader container");
+                    }
                     if let Ok(t) = &done {
-                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
+                        if let Err(error) = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil) {
+                            tracing::warn!(path = %dir.join(format!("{stem}.dxil")).display(), %error, "could not save translated shader");
+                        }
                     }
                 }
                 if let Ok(t) = &done {
@@ -193,6 +202,41 @@ impl Shader {
                 done.ok()
             })
             .as_ref()
+    }
+}
+
+#[cfg(windows)]
+fn shader_save_selected(hash: &str) -> bool {
+    static FILTER: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    FILTER
+        .get_or_init(|| {
+            std::env::var("VICTORY_SHADER_SAVE_HASHES")
+                .ok()
+                .map(|value| parse_shader_save_hashes(&value))
+        })
+        .as_ref()
+        .is_none_or(|hashes| hashes.iter().any(|candidate| candidate == hash))
+}
+
+fn parse_shader_save_hashes(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|hash| hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+#[cfg(test)]
+mod shader_save_tests {
+    use super::parse_shader_save_hashes;
+
+    #[test]
+    fn parses_only_exact_hex_hashes_and_normalizes_case() {
+        assert_eq!(
+            parse_shader_save_hashes(" 02384A60FDA6F2D0,not-a-hash,5dc3b25986622949,short "),
+            ["02384a60fda6f2d0", "5dc3b25986622949"]
+        );
     }
 }
 
