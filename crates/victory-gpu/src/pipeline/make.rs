@@ -512,6 +512,7 @@ fn workers() -> bool {
                         let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
                         let _ = SetThreadPriority(GetCurrentThread(), priority);
                     }
+                    crate::cores::keep_background_on_aux_cores("victory-pipelines");
                     loop {
                         let p = next(screens_only);
                         p.make();
