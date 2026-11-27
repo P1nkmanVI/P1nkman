@@ -19,8 +19,9 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
@@ -35,7 +36,11 @@ const SPARE_KEPT: usize = 64;
 /// The same of blocks of staging buffers, which are the PC's memory: run
 /// crash-1 held 5.2 GB of them.
 const STAGING_KEPT: usize = 8;
-/// How many are kept now.
+/// Empty blocks kept for pooled GPU UAV buffers (4 * 64 MiB = 256 MiB max).
+const UAV_KEPT: usize = 4;
+/// Empty blocks kept for pooled CPU-mapped shared buffers (4 * 64 MiB = 256 MiB max).
+const SHARED_KEPT: usize = 4;
+/// How many empty blocks are kept now (for textures).
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
@@ -43,6 +48,7 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let pressure = crate::residency::pressured();
+    let critical = crate::residency::critical_commit();
     let limit = spares(memory, crate::host::keep_freed() && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
@@ -51,15 +57,28 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     if let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
     }
+    let host_ram_limit = if critical {
+        0
+    } else if pressure {
+        1
+    } else {
+        limit
+    };
     if let Ok(mut pool) = STAGING.try_lock() {
-        let staging_limit = if crate::residency::critical_commit() {
+        pool.reclaim(tick, host_ram_limit, true);
+    }
+    if let Ok(mut pool) = UAV_BUFFERS.try_lock() {
+        let uav_limit = if critical {
             0
         } else if pressure {
             1
         } else {
-            limit
+            limit.min(UAV_KEPT)
         };
-        pool.reclaim(tick, staging_limit, true);
+        pool.reclaim(tick, uav_limit, true);
+    }
+    if let Ok(mut pool) = SHARED_BUFFERS.try_lock() {
+        pool.reclaim(tick, host_ram_limit.min(SHARED_KEPT), true);
     }
 }
 
@@ -80,8 +99,35 @@ fn now() -> u64 {
 }
 
 pub(crate) fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_POOL").is_none_or(|v| v != "0"))
+}
+
+/// Whether `uav_buffer` and `shared_buffer` suballocate from pre-mapped 64 MiB
+/// heaps (`VICTORY_BUFFER_POOL=0`: each buffer is a committed allocation).
+pub(crate) fn buffer_pool_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    on() && *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_POOL").is_none_or(|v| v != "0"))
+}
+
+/// Empty blocks kept ready ahead for `UAV_BUFFERS` / `SHARED_BUFFERS` by the
+/// background grower, clamped to 0 under pressure or high VRAM use.
+fn bg_ahead_for(base: usize, vram: Option<[u64; 4]>, pressure: bool, critical: bool, is_vram: bool) -> usize {
+    if base == 0 || pressure || critical {
+        return 0;
+    }
+    if is_vram && let Some([budget, used, ..]) = vram {
+        if budget > 0 {
+            let next = u128::from(used.saturating_add(BLOCK));
+            if next * 100 > u128::from(budget) * 90 {
+                return 0;
+            }
+            if next * 100 > u128::from(budget) * 85 {
+                return base.min(1);
+            }
+        }
+    }
+    base
 }
 
 /// How many blocks of textures are made ahead, so that one has been there
@@ -190,6 +236,12 @@ struct Block<B> {
     since: u64,
 }
 
+enum TryTake<B> {
+    Found { piece: Piece, memory: B, again: bool, need_more: bool },
+    Empty { can_grow: bool },
+    TooLarge,
+}
+
 struct Pool<B> {
     /// `None`: a block let go, its place to be used again.
     blocks: Vec<Option<Block<B>>>,
@@ -208,12 +260,14 @@ impl<B: Clone> Pool<B> {
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
     /// part was ever used before; `make` makes a block when none has room.
+    #[cfg(test)]
     fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
         self.take_ripe(len, align, now, Ripe::ALL, make)
     }
 
     /// The same from a block that is ripe, if one has room; `make` makes one
     /// ahead too, when few are empty.
+    #[cfg(test)]
     fn take_ripe(
         &mut self,
         len: u64,
@@ -275,6 +329,7 @@ impl<B: Clone> Pool<B> {
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
     }
 
+    #[cfg(test)]
     fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
         if now < self.retry_growth_at {
             return None;
@@ -284,6 +339,76 @@ impl<B: Clone> Pool<B> {
             self.retry_growth_at = now.saturating_add(500);
         }
         block
+    }
+
+    fn empty_blocks(&self) -> usize {
+        self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count()
+    }
+
+    fn can_grow(&self, now: u64) -> bool {
+        now >= self.retry_growth_at
+    }
+
+    fn note_growth_failed(&mut self, now: u64) {
+        self.retry_growth_at = now.saturating_add(500);
+    }
+
+    /// Lock-friendly allocation: takes a piece from an existing block without
+    /// ever invoking a driver allocation while the pool mutex is held. Returns
+    /// whether the background grower should top up empty blocks, or whether the
+    /// caller must grow a block outside the lock as a fallback.
+    fn try_take_ripe(&mut self, len: u64, align: u64, now: u64, ripe: Ripe) -> TryTake<B> {
+        if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
+            return TryTake::TooLarge;
+        }
+        self.rested(now);
+        let mut found = None;
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            if let Some(block) = block
+                && ripe.is(block)
+                && let Some(start) = block.free.take(len, align)
+            {
+                found = Some((i, start));
+                break;
+            }
+        }
+        if found.is_none() && ripe.ahead > 0 {
+            let mut unripe: Vec<(u64, usize)> =
+                self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
+            unripe.sort_unstable();
+            found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
+        }
+        let Some((i, start)) = found else {
+            return TryTake::Empty { can_grow: self.can_grow(now) };
+        };
+        if ripe.ahead > 0 && !ripe.is(self.blocks[i].as_ref().unwrap()) {
+            let n = UNRIPE.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
+            }
+        }
+        let need_more = ripe.ahead > 0 && self.empty_blocks() < ripe.ahead && self.can_grow(now);
+        let block = self.blocks[i].as_mut().unwrap();
+        let again = start < block.used_to;
+        block.used_to = block.used_to.max(start + len);
+        TryTake::Found {
+            piece: Piece { block: i, start, len },
+            memory: block.memory.clone(),
+            again,
+            need_more,
+        }
+    }
+
+    /// Inserts `memory` as a new block and immediately cuts `(len, align)` from
+    /// it (used after a fallback allocation completed outside the pool lock).
+    fn add_and_take(&mut self, memory: B, made: u64, len: u64, align: u64, ahead: usize) -> Option<(Piece, B, bool, bool)> {
+        let i = self.add(memory, made);
+        let start = self.blocks[i].as_mut()?.free.take(len, align)?;
+        let need_more = ahead > 0 && self.empty_blocks() < ahead;
+        let block = self.blocks[i].as_mut()?;
+        let again = start < block.used_to;
+        block.used_to = block.used_to.max(start + len);
+        Some((Piece { block: i, start, len }, block.memory.clone(), again, need_more))
     }
 
     fn add(&mut self, memory: B, made: u64) -> usize {
@@ -348,13 +473,293 @@ unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
 static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static UAV_BUFFERS: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(UAV_KEPT));
+static SHARED_BUFFERS: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SHARED_KEPT));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Bytes of the pieces textures hold now.
+/// Bytes of the pieces held now per pool.
 static HELD: AtomicU64 = AtomicU64::new(0);
+static UAV_HELD: AtomicU64 = AtomicU64::new(0);
+static SHARED_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// Pool telemetry counters:
+/// `[0]` tex bg blocks, `[1]` tex sync fallback blocks,
+/// `[2]` uav hits, `[3]` uav bg blocks, `[4]` uav sync fallback blocks,
+/// `[5]` shared hits, `[6]` shared bg blocks, `[7]` shared sync fallback blocks.
+static POOL_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PoolStats {
+    pub(crate) tex_blocks: usize,
+    pub(crate) tex_bg: u64,
+    pub(crate) tex_sync: u64,
+    pub(crate) uav_hits: u64,
+    pub(crate) uav_blocks: usize,
+    pub(crate) uav_bg: u64,
+    pub(crate) uav_sync: u64,
+    pub(crate) shared_hits: u64,
+    pub(crate) shared_blocks: usize,
+    pub(crate) shared_bg: u64,
+    pub(crate) shared_sync: u64,
+    pub(crate) staging_blocks: usize,
+}
+
+pub(crate) fn stats() -> PoolStats {
+    PoolStats {
+        tex_blocks: TEXTURES.try_lock().map_or(0, |p| p.blocks()),
+        tex_bg: POOL_STATS[0].load(Ordering::Relaxed),
+        tex_sync: POOL_STATS[1].load(Ordering::Relaxed),
+        uav_hits: POOL_STATS[2].load(Ordering::Relaxed),
+        uav_blocks: UAV_BUFFERS.try_lock().map_or(0, |p| p.blocks()),
+        uav_bg: POOL_STATS[3].load(Ordering::Relaxed),
+        uav_sync: POOL_STATS[4].load(Ordering::Relaxed),
+        shared_hits: POOL_STATS[5].load(Ordering::Relaxed),
+        shared_blocks: SHARED_BUFFERS.try_lock().map_or(0, |p| p.blocks()),
+        shared_bg: POOL_STATS[6].load(Ordering::Relaxed),
+        shared_sync: POOL_STATS[7].load(Ordering::Relaxed),
+        staging_blocks: STAGING.try_lock().map_or(0, |p| p.blocks()),
+    }
+}
+
+struct GrowerState {
+    device: Option<ID3D12Device>,
+    pending: bool,
+}
+// SAFETY: `ID3D12Device` is free-threaded.
+unsafe impl Send for GrowerState {}
+
+struct Grower {
+    state: Mutex<GrowerState>,
+    wake: Condvar,
+}
+
+static GROWER: OnceLock<Grower> = OnceLock::new();
+static GROWER_STARTED: std::sync::Once = std::sync::Once::new();
+
+fn wake_grower(device: &ID3D12Device) {
+    let grower = GROWER.get_or_init(|| Grower {
+        state: Mutex::new(GrowerState { device: Some(device.clone()), pending: true }),
+        wake: Condvar::new(),
+    });
+    GROWER_STARTED.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("victory-pool-grow".to_owned())
+            .spawn(grower_loop);
+    });
+    let mut s = grower.state.lock().unwrap_or_else(|e| e.into_inner());
+    if s.device.is_none() {
+        s.device = Some(device.clone());
+    }
+    s.pending = true;
+    grower.wake.notify_one();
+}
+
+fn make_texture_block(device: &ID3D12Device) -> Option<ID3D12Heap> {
+    let desc = D3D12_HEAP_DESC {
+        SizeInBytes: BLOCK,
+        Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+        Alignment: 0,
+        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
+    };
+    let mut heap: Option<ID3D12Heap> = None;
+    // SAFETY: plain heap creation on live device.
+    if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+        crate::residency::allocation_error(&e);
+        tracing::warn!(error = %e, "no block of texture memory");
+        return None;
+    }
+    let heap = heap?;
+    if let Err(e) = crate::host::resident_and_mapped_sync(device, &heap) {
+        crate::residency::allocation_error(&e);
+        tracing::warn!(error = %e, "a block of texture memory is not resident");
+        return None;
+    }
+    Some(heap)
+}
+
+fn make_uav_block(device: &ID3D12Device) -> Option<ID3D12Heap> {
+    let desc = D3D12_HEAP_DESC {
+        SizeInBytes: BLOCK,
+        Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+        Alignment: 0,
+        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | crate::host::not_resident(),
+    };
+    let mut heap: Option<ID3D12Heap> = None;
+    // SAFETY: plain heap creation on live device.
+    if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+        crate::residency::allocation_error(&e);
+        tracing::warn!(error = %e, "no block of GPU buffer memory");
+        return None;
+    }
+    let heap = heap?;
+    if let Err(e) = crate::host::resident_and_mapped_sync(device, &heap) {
+        crate::residency::allocation_error(&e);
+        tracing::warn!(error = %e, "a block of GPU buffer memory is not resident");
+        return None;
+    }
+    Some(heap)
+}
+
+fn make_shared_block(device: &ID3D12Device) -> Option<ID3D12Heap> {
+    let desc = D3D12_HEAP_DESC {
+        SizeInBytes: BLOCK,
+        Properties: D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        },
+        Alignment: 0,
+        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | crate::host::not_resident(),
+    };
+    let mut heap: Option<ID3D12Heap> = None;
+    // SAFETY: plain heap creation on live device.
+    if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+        crate::residency::allocation_error(&e);
+        tracing::warn!(error = %e, "no block of shared buffer memory");
+        return None;
+    }
+    let heap = heap?;
+    if let Err(e) = crate::host::resident_and_mapped_sync(device, &heap) {
+        crate::residency::allocation_error(&e);
+        tracing::warn!(error = %e, "a block of shared buffer memory is not resident");
+        return None;
+    }
+    Some(heap)
+}
+
+fn grower_loop() {
+    // SAFETY: plain priority adjustment on our own helper thread.
+    unsafe {
+        use windows::Win32::System::Threading::*;
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+    crate::cores::keep_background_on_aux_cores("victory-pool-grow");
+    let Some(grower) = GROWER.get() else { return };
+    loop {
+        let device = {
+            let mut s = grower.state.lock().unwrap_or_else(|e| e.into_inner());
+            while !s.pending || s.device.is_none() {
+                s = grower.wake.wait(s).unwrap_or_else(|e| e.into_inner());
+            }
+            s.pending = false;
+            s.device.clone().unwrap()
+        };
+        // Round-robin 1 block per pool per pass so textures, UAV buffers and
+        // shared buffers all warm up concurrently without starving each other.
+        loop {
+            let pressure = crate::residency::pressured();
+            let critical = crate::residency::critical_commit();
+            let vram = crate::host::video_memory_ready();
+            let mut made_any = false;
+            let mut backoff_waiting = false;
+
+            // 1. Texture pool ahead blocks.
+            let tex_target = bg_ahead_for(
+                ahead().min(SPARES.load(Ordering::Relaxed)),
+                vram,
+                pressure,
+                critical,
+                true,
+            );
+            let tex_need = {
+                let tick = now();
+                let pool = lock(&TEXTURES);
+                if tex_target > 0 && pool.empty_blocks() < tex_target {
+                    if pool.can_grow(tick) {
+                        true
+                    } else {
+                        backoff_waiting = true;
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if tex_need {
+                let (started, _) = crate::host::submissions();
+                if let Some(heap) = make_texture_block(&device) {
+                    lock(&TEXTURES).add(heap, started);
+                    POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+                    made_any = true;
+                } else {
+                    lock(&TEXTURES).note_growth_failed(now());
+                    backoff_waiting = true;
+                }
+            }
+
+            if buffer_pool_on() {
+                // 2. GPU UAV buffer pool ahead blocks (1-2 blocks = 64-128 MiB).
+                let uav_target = bg_ahead_for(2, vram, pressure, critical, true);
+                let uav_need = {
+                    let tick = now();
+                    let pool = lock(&UAV_BUFFERS);
+                    if uav_target > 0 && pool.empty_blocks() < uav_target {
+                        if pool.can_grow(tick) {
+                            true
+                        } else {
+                            backoff_waiting = true;
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if uav_need {
+                    let (started, _) = crate::host::submissions();
+                    if let Some(heap) = make_uav_block(&device) {
+                        lock(&UAV_BUFFERS).add(heap, started);
+                        POOL_STATS[3].fetch_add(1, Ordering::Relaxed);
+                        made_any = true;
+                    } else {
+                        lock(&UAV_BUFFERS).note_growth_failed(now());
+                        backoff_waiting = true;
+                    }
+                }
+
+                // 3. Shared L0 WRITE_BACK buffer pool ahead blocks (1-2 blocks).
+                let base_shared = if crate::residency::limited_host_ram() { 1 } else { 2 };
+                let shared_target = bg_ahead_for(base_shared, vram, pressure, critical, false);
+                let shared_need = {
+                    let tick = now();
+                    let pool = lock(&SHARED_BUFFERS);
+                    if shared_target > 0 && pool.empty_blocks() < shared_target {
+                        if pool.can_grow(tick) {
+                            true
+                        } else {
+                            backoff_waiting = true;
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if shared_need {
+                    let (started, _) = crate::host::submissions();
+                    if let Some(heap) = make_shared_block(&device) {
+                        lock(&SHARED_BUFFERS).add(heap, started);
+                        POOL_STATS[6].fetch_add(1, Ordering::Relaxed);
+                        made_any = true;
+                    } else {
+                        lock(&SHARED_BUFFERS).note_growth_failed(now());
+                        backoff_waiting = true;
+                    }
+                }
+            }
+
+            if !made_any {
+                if backoff_waiting {
+                    let s = grower.state.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = grower.wake.wait_timeout(s, Duration::from_millis(500));
+                }
+                break;
+            }
+        }
+    }
+}
 
 /// Bytes of the texture blocks no texture holds: the card's memory in use
 /// by us that new textures take first.
@@ -385,18 +790,31 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
-        // Only gate speculative bindless prefetch on staging-pool growth
-        // headroom; table-bound textures and decoration bakes are sampled
-        // immediately and would otherwise read uninitialized/reused VRAM.
-        let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
-        if speculative && !crate::residency::allow_staging_growth(false) {
-            return None;
+    let tick = now();
+    let taken = lock(&STAGING).try_take_ripe(bytes, 512, tick, Ripe::ALL);
+    let (piece, memory, again) = match taken {
+        TryTake::Found { piece, memory, again, .. } => (piece, memory, again),
+        TryTake::TooLarge => return None,
+        TryTake::Empty { can_grow: false } => return None,
+        TryTake::Empty { can_grow: true } => {
+            // Only gate speculative bindless prefetch on staging-pool growth
+            // headroom; table-bound textures and decoration bakes are sampled
+            // immediately and would otherwise read uninitialized/reused VRAM.
+            let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
+            if speculative && !crate::residency::allow_staging_growth(false) {
+                lock(&STAGING).note_growth_failed(tick);
+                return None;
+            }
+            // Allocate outside `STAGING`'s lock so drops/reclaims never stall.
+            let Some((buffer, data)) = host.upload_buffer(BLOCK) else {
+                lock(&STAGING).note_growth_failed(now());
+                return None;
+            };
+            crate::host::name(&buffer, || "staging of textures (a block)".into());
+            let (piece, memory, again, _) = lock(&STAGING).add_and_take(Upload(buffer, data), 0, bytes, 512, 0)?;
+            (piece, memory, again)
         }
-        let (buffer, data) = host.upload_buffer(BLOCK)?;
-        crate::host::name(&buffer, || "staging of textures (a block)".into());
-        Some(Upload(buffer, data))
-    })?;
+    };
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
@@ -409,13 +827,18 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     Some((owned, memory.0, piece.start, data))
 }
 
-/// An object the host texture holds and releases when it goes: its piece
+const POOL_TEXTURES: u8 = 0;
+const POOL_UAV: u8 = 1;
+const POOL_SHARED: u8 = 2;
+
+/// An object a pooled resource holds and releases when it goes: its piece
 /// is free then.
 #[repr(C)]
 struct Reclaim {
     methods: &'static [*const (); 3],
     references: AtomicU32,
     piece: Piece,
+    pool: u8,
 }
 
 struct Methods([*const (); 3]);
@@ -452,8 +875,21 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
-            HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
-            lock(&TEXTURES).give(gone.piece, now());
+            match gone.pool {
+                POOL_TEXTURES => {
+                    HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
+                    lock(&TEXTURES).give(gone.piece, now());
+                }
+                POOL_UAV => {
+                    UAV_HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
+                    lock(&UAV_BUFFERS).give(gone.piece, now());
+                }
+                POOL_SHARED => {
+                    SHARED_HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
+                    lock(&SHARED_BUFFERS).give(gone.piece, now());
+                }
+                _ => {}
+            }
         }
         left
     }
@@ -478,15 +914,15 @@ fn made_now(texture: &ID3D12Resource) {
     recent.push_back((texture.as_raw() as usize, now));
 }
 
-/// Makes `texture` give `piece` back when the last reference to it goes.
-fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
+/// Makes `resource` give `piece` back to `pool` when its last reference goes.
+fn give_back_with(resource: &ID3D12Resource, piece: Piece, pool: u8) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
+    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, pool }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
         let object = IUnknown::from_raw(made.cast());
-        if texture.SetPrivateDataInterface(&KEY, &object).is_err() {
+        if resource.SetPrivateDataInterface(&KEY, &object).is_err() {
             // Never given back: the piece stays taken, nothing is reused
             // under a texture that may be alive.
             std::mem::forget(object);
@@ -521,28 +957,29 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
+    let align = info.Alignment.max(1);
+    let tick = now();
+    let ripe = Ripe::now();
+    let taken = lock(&TEXTURES).try_take_ripe(info.SizeInBytes, align, tick, ripe);
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
-        let desc = D3D12_HEAP_DESC {
-            SizeInBytes: BLOCK,
-            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
-            Alignment: 0,
-            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
-        };
-        let mut heap: Option<ID3D12Heap> = None;
-        // SAFETY: plain creation.
-        if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
-            crate::residency::allocation_error(&e);
-            tracing::warn!(error = %e, "no block of texture memory");
+    let (piece, heap, again, need_more) = match taken {
+        TryTake::Found { piece, memory, again, need_more } => (piece, memory, again, need_more),
+        TryTake::TooLarge => return None,
+        TryTake::Empty { can_grow: false } => return None,
+        TryTake::Empty { can_grow: true } => {
+            // Fallback only when background blocks ran dry: allocate outside
+            // `TEXTURES`'s lock so drops and concurrent lookups never stall.
+            let Some(heap) = make_texture_block(device) else {
+                lock(&TEXTURES).note_growth_failed(now());
+                return None;
+            };
+            POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+            lock(&TEXTURES).add_and_take(heap, ripe.started, info.SizeInBytes, align, ripe.ahead)?
         }
-        if let Some(h) = &heap
-            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
-        {
-            tracing::warn!(error = %e, "a block of texture memory is not resident");
-            return None;
-        }
-        heap
-    })?;
+    };
+    if need_more {
+        wake_grower(device);
+    }
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -550,7 +987,7 @@ pub(crate) unsafe fn texture(
     match (result, made) {
         (Ok(()), Some(made)) => {
             HELD.fetch_add(piece.len, Ordering::Relaxed);
-            give_back_with(&made, piece);
+            give_back_with(&made, piece, POOL_TEXTURES);
             made_now(&made);
             #[cfg(feature = "diagnostics")]
             {
@@ -574,6 +1011,149 @@ pub(crate) unsafe fn texture(
         }
         _ => {
             lock(&TEXTURES).give(piece, now());
+            None
+        }
+    }
+}
+
+/// A device-local unordered-access buffer placed in a pre-mapped 64 MiB heap
+/// (`D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS`). `None` if unpooled, larger than
+/// `BLOCK / 2`, or the host refused.
+pub(crate) fn uav_buffer(device: &ID3D12Device, size: u64) -> Option<ID3D12Resource> {
+    if !buffer_pool_on() {
+        return None;
+    }
+    let width = size.max(1);
+    let align = u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+    let alloc = width.next_multiple_of(align);
+    if alloc > BLOCK / 2 {
+        return None;
+    }
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Alignment: align,
+        Width: width,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let (started, finished) = crate::host::submissions();
+    let ripe = Ripe { started, finished, ahead: 2 };
+    let tick = now();
+    let taken = lock(&UAV_BUFFERS).try_take_ripe(alloc, align, tick, ripe);
+    let (piece, heap, _again, need_more) = match taken {
+        TryTake::Found { piece, memory, again, need_more } => (piece, memory, again, need_more),
+        TryTake::TooLarge => return None,
+        TryTake::Empty { can_grow: false } => return None,
+        TryTake::Empty { can_grow: true } => {
+            let Some(heap) = make_uav_block(device) else {
+                lock(&UAV_BUFFERS).note_growth_failed(now());
+                return None;
+            };
+            POOL_STATS[4].fetch_add(1, Ordering::Relaxed);
+            lock(&UAV_BUFFERS).add_and_take(heap, started, alloc, align, 2)?
+        }
+    };
+    if need_more {
+        wake_grower(device);
+    }
+    let mut made: Option<ID3D12Resource> = None;
+    // SAFETY: `piece` is exclusively owned, `heap` is already resident and
+    // mapped in GPU page tables, and `heap` outlives `made` via `Reclaim`.
+    let result = unsafe {
+        device.CreatePlacedResource(&heap, piece.start, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut made)
+    };
+    match (result, made) {
+        (Ok(()), Some(made)) => {
+            UAV_HELD.fetch_add(piece.len, Ordering::Relaxed);
+            POOL_STATS[2].fetch_add(1, Ordering::Relaxed);
+            give_back_with(&made, piece, POOL_UAV);
+            Some(made)
+        }
+        _ => {
+            lock(&UAV_BUFFERS).give(piece, now());
+            None
+        }
+    }
+}
+
+/// A CPU-mapped write-back (`L0`) unordered-access buffer placed in a
+/// pre-mapped 64 MiB custom heap (`D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS`), zeroed
+/// on piece reuse. `None` if unpooled, larger than `BLOCK / 2`, or refused.
+pub(crate) fn shared_buffer(device: &ID3D12Device, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    if !buffer_pool_on() {
+        return None;
+    }
+    let width = size.max(1);
+    let align = u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+    let alloc = width.next_multiple_of(align);
+    if alloc > BLOCK / 2 {
+        return None;
+    }
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Alignment: align,
+        Width: width,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let (started, finished) = crate::host::submissions();
+    let ahead_target = if crate::residency::limited_host_ram() { 1 } else { 2 };
+    let ripe = Ripe { started, finished, ahead: ahead_target };
+    let tick = now();
+    let taken = lock(&SHARED_BUFFERS).try_take_ripe(alloc, align, tick, ripe);
+    let (piece, heap, again, need_more) = match taken {
+        TryTake::Found { piece, memory, again, need_more } => (piece, memory, again, need_more),
+        TryTake::TooLarge => return None,
+        TryTake::Empty { can_grow: false } => return None,
+        TryTake::Empty { can_grow: true } => {
+            let Some(heap) = make_shared_block(device) else {
+                lock(&SHARED_BUFFERS).note_growth_failed(now());
+                return None;
+            };
+            POOL_STATS[7].fetch_add(1, Ordering::Relaxed);
+            lock(&SHARED_BUFFERS).add_and_take(heap, started, alloc, align, ahead_target)?
+        }
+    };
+    if need_more {
+        wake_grower(device);
+    }
+    let mut made: Option<ID3D12Resource> = None;
+    let mut data = std::ptr::null_mut();
+    // SAFETY: `piece` is exclusively owned, `heap` is CPU-visible L0 WRITE_BACK
+    // and already resident & mapped; `Reclaim` keeps the piece alive until the
+    // last COM reference to `made` is released.
+    let result = unsafe {
+        device
+            .CreatePlacedResource(&heap, piece.start, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut made)
+            .and_then(|()| {
+                let b = made.as_ref().ok_or_else(windows::core::Error::empty)?;
+                b.Map(0, None, Some(&mut data))
+            })
+    };
+    match (result, made) {
+        (Ok(()), Some(made)) => {
+            let ptr = data.cast::<u8>();
+            if again {
+                // SAFETY: `ptr` maps at least `width` exclusively owned bytes.
+                unsafe { std::ptr::write_bytes(ptr, 0, width as usize) };
+            }
+            SHARED_HELD.fetch_add(piece.len, Ordering::Relaxed);
+            POOL_STATS[5].fetch_add(1, Ordering::Relaxed);
+            give_back_with(&made, piece, POOL_SHARED);
+            Some((made, ptr))
+        }
+        _ => {
+            lock(&SHARED_BUFFERS).give(piece, now());
             None
         }
     }
@@ -745,5 +1325,79 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    #[test]
+    fn try_take_ripe_signals_background_refill_without_growing_under_lock() {
+        let mut pool: Pool<u64> = Pool::new(4);
+        let ripe = Ripe { started: 5, finished: 5, ahead: 2 };
+        assert!(matches!(pool.try_take_ripe(BLOCK / 2, 65536, 0, ripe), TryTake::Empty { can_grow: true }));
+        pool.note_growth_failed(100);
+        assert!(matches!(pool.try_take_ripe(BLOCK / 2, 65536, 599, ripe), TryTake::Empty { can_grow: false }));
+        assert!(matches!(pool.try_take_ripe(BLOCK / 2, 65536, 600, ripe), TryTake::Empty { can_grow: true }));
+
+        pool.add(1, 4);
+        pool.add(2, 4);
+        match pool.try_take_ripe(BLOCK / 2, 65536, 600, ripe) {
+            TryTake::Found { memory, need_more, .. } => {
+                assert_eq!(memory, 1);
+                // Only 1 empty block remains (< ahead 2), so background grower is woken.
+                assert!(need_more);
+            }
+            _ => panic!("expected hit from pre-allocated block"),
+        }
+        pool.add(3, 5);
+        pool.add(4, 5);
+        match pool.try_take_ripe(BLOCK / 2, 65536, 600, ripe) {
+            TryTake::Found { memory, need_more, .. } => {
+                assert_eq!(memory, 1);
+                // 3 empty blocks remain (>= ahead 2), so no background wake needed.
+                assert!(!need_more);
+            }
+            _ => panic!("expected hit from remaining half of block 1"),
+        }
+    }
+
+    #[test]
+    fn background_ahead_target_respects_vram_and_memory_pressure() {
+        let gib = 1024 * 1024 * 1024u64;
+        assert_eq!(bg_ahead_for(12, Some([8 * gib, 4 * gib, 0, 0]), false, false, true), 12);
+        // Between 85% and 90% VRAM: cap at 1 empty block.
+        assert_eq!(bg_ahead_for(12, Some([8 * gib, 7 * gib, 0, 0]), false, false, true), 1);
+        // Past 90% VRAM: stop background pre-allocation completely.
+        assert_eq!(bg_ahead_for(12, Some([8 * gib, 7 * gib + 400 * (1 << 20), 0, 0]), false, false, true), 0);
+        // Host RAM pressure or critical commit always stops background pre-allocation.
+        assert_eq!(bg_ahead_for(2, Some([8 * gib, 2 * gib, 0, 0]), true, false, true), 0);
+        assert_eq!(bg_ahead_for(2, Some([8 * gib, 2 * gib, 0, 0]), false, true, false), 0);
+    }
+
+    #[test]
+    fn uav_and_shared_buffer_pools_place_reclaim_and_zero_on_reuse() {
+        let Some(host) = crate::host::host() else { return };
+        let Some(uav) = uav_buffer(&host.device, 4096) else { return };
+        assert_eq!(crate::host::references(&uav), 1);
+        let uav_before = lock(&UAV_BUFFERS).resting.len();
+        drop(uav);
+        assert_eq!(lock(&UAV_BUFFERS).resting.len(), uav_before + 1);
+
+        let Some((sh, ptr)) = shared_buffer(&host.device, 4096) else { return };
+        assert_eq!(crate::host::references(&sh), 1);
+        let sh_before = lock(&SHARED_BUFFERS).resting.len();
+        // SAFETY: `ptr` maps 4096 exclusively owned bytes of the placed buffer.
+        unsafe {
+            std::ptr::write_bytes(ptr, 0x5A, 4096);
+            assert_eq!(*ptr, 0x5A);
+        }
+        drop(sh);
+        assert_eq!(lock(&SHARED_BUFFERS).resting.len(), sh_before + 1);
+        lock(&SHARED_BUFFERS).rested(u64::MAX);
+        let Some((sh2, ptr2)) = shared_buffer(&host.device, 4096) else { return };
+        // SAFETY: reused piece must be zeroed.
+        unsafe {
+            assert!((0..4096).all(|i| *ptr2.add(i) == 0));
+        }
+        drop(sh2);
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }
