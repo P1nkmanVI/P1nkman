@@ -24,10 +24,9 @@ jobs:
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Clippy, diagnostics build
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      # Includes xtask's repository_passes_policy, the asset-policy check.
-      - name: Tests
-        run: cargo test --workspace --locked
+      - name: Initialize format tables
+        run: ./Initialize-FormatTables.ps1
+      - name: Asset policy
+        run: cargo xtask policy
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
