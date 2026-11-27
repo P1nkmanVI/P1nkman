@@ -2,6 +2,8 @@
 
 ### Um projeto brasileiro de compatibilidade Xbox Series para Windows
 
+> 🟢 **Este é o único repositório oficial do P1nkman:** [github.com/P1nkmanVI/P1nkman](https://github.com/P1nkmanVI/P1nkman).
+
 O P1nkman reúne trabalho da comunidade para tornar uma experiência de Xbox Series acessível no PC com Windows, a partir dos arquivos do jogo que cada pessoa já possui. Esta edição parte do **cool_fox**, da família [VIctory](https://github.com/Marvisak/VIctory), e acrescenta a identidade P1nkman e a barra de desempenho em português.
 
 > **Projeto experimental.** Ainda existem falhas de imagem, travamentos e oscilações de desempenho. Não somos afiliados à desenvolvedora nem à distribuidora do jogo. Este repositório não contém arquivos do jogo.
