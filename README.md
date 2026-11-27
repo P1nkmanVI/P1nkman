@@ -4,7 +4,7 @@
 
 > 🟢 **Este é o único repositório oficial do P1nkman:** [github.com/P1nkmanVI/P1nkman](https://github.com/P1nkmanVI/P1nkman).
 
-O P1nkman reúne trabalho da comunidade para tornar uma experiência de Xbox Series acessível no PC com Windows, a partir dos arquivos do jogo que cada pessoa já possui. Esta edição parte do **cool_fox**, da família [VIctory](https://github.com/Marvisak/VIctory), e acrescenta a identidade P1nkman e a barra de desempenho em português.
+O P1nkman reúne trabalho da comunidade para tornar uma experiência de Xbox Series acessível no PC com Windows, a partir dos arquivos do jogo que cada pessoa já possui. A base em implementação parte do [VI-BR-PORT](https://github.com/edsuuu/VI-BR-PORT), da família [VIctory](https://github.com/Marvisak/VIctory), com a identidade P1nkman e a barra de desempenho em português.
 
 > **Projeto experimental.** Ainda existem falhas de imagem, travamentos e oscilações de desempenho. Não somos afiliados à desenvolvedora nem à distribuidora do jogo. Este repositório não contém arquivos do jogo.
 
@@ -14,9 +14,9 @@ O P1nkman reúne trabalho da comunidade para tornar uma experiência de Xbox Ser
 
 Começamos em 24 de novembro de 2026 testando diferentes bases, ajustes gráficos e formas de reduzir travamentos. Avançamos da abertura até trechos do modo história, testamos a navegação na água e chegamos à cidade. Também experimentamos correções para controles, rosto e memória em versões anteriores.
 
-Nesta nova base estamos priorizando a continuidade dos testes no **perfil Series S**, usando o conjunto `pareto-residency` do cool_fox. A janela mostra FPS, tempo por quadro, pior quadro recente, estimativas de GPU e CPU, RAM do processo, draws e tempo de execução.
+Estamos implementando e testando a nova base, com prioridade ao **perfil Series S**. Agora trabalhamos na renderização para melhorar a qualidade visual e as texturas 3D. A janela mostra FPS, tempo por quadro, pior quadro recente, estimativas de GPU e CPU, RAM do processo, draws e tempo de execução.
 
-**Desempenho relatado:** o criador observou cerca de **15 FPS em modo história**. Essa é uma observação de teste, não uma garantia para toda a campanha ou para outras máquinas; ainda faltam registrar cena, duração, configuração e medições detalhadas para uma comparação reproduzível. Há também relatos anteriores mais lentos em outras builds e cenas.
+**Desempenho relatado:** em um teste, o criador observou cerca de **20 FPS durante aproximadamente 50 minutos**. Esse relato não garante o mesmo resultado em outras cenas ou computadores; ainda precisamos registrar as condições e repetir medições para estabelecer uma comparação reproduzível.
 
 ## 📊 Progresso
 
@@ -92,7 +92,8 @@ Quem quiser contribuir com código pode trabalhar em uma cópia, documentar a or
 
 ## 🙏 Créditos e licença
 
-- [cool_fox](https://github.com/DoubleGhosty/cool_fox), base desta edição; o ZIP usado foi identificado com o commit `f4b48ad766ddbec1a1867022cd42f7645b0dd55e`.
+- [VI-BR-PORT](https://github.com/edsuuu/VI-BR-PORT), de edsuuu e colaboradores, base da versão em implementação neste branch (commit `94e5841537daed4596fa7126cbda714fe550925b`).
+- [cool_fox](https://github.com/DoubleGhosty/cool_fox), base de uma edição anterior; o ZIP usado foi identificado com o commit `f4b48ad766ddbec1a1867022cd42f7645b0dd55e`.
 - [VIctory](https://github.com/Marvisak/VIctory), por Marvisak e colaboradores, e [fxceless/victory-fork](https://github.com/fxceless/victory-fork), de onde vêm partes fundamentais da base.
 - DexNom, Belobug, Joshua Odom, Geckomacabre e demais colaboradores citados na [documentação da base](README.coolfox.md).
 - A barra e a identidade P1nkman foram adaptadas ao código da base para este projeto.
