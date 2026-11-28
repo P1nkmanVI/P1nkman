@@ -88,8 +88,6 @@ pub(crate) extern "system" fn completed(this: This) -> u64 {
 /// The title's `GetCompletedValue`.
 extern "system" fn completed_called(this: This) -> u64 {
     let value = completed(this);
-    #[cfg(windows)]
-    crate::titletime::polled(this as usize, value);
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::polled(this as usize, value);
     value
@@ -117,7 +115,32 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
             if fence.value.load(Ordering::Acquire) >= value {
                 return S_OK;
             }
-            tracing::warn!(value, "blocking fence wait not implemented");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            loop {
+                let current = fence.value.load(Ordering::Acquire);
+                if current >= value {
+                    return S_OK;
+                }
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let ms = (deadline - now).as_millis().min(10) as u32;
+                // SAFETY: wait on the atomic u64 until woken by WakeByAddressAll or timeout.
+                unsafe {
+                    windows_sys::Win32::System::Threading::WaitOnAddress(
+                        (&raw const fence.value).cast(),
+                        (&raw const current).cast(),
+                        size_of::<u64>(),
+                        ms.max(1),
+                    );
+                }
+                crate::queue::release_held(false);
+            }
+            if fence.value.load(Ordering::Acquire) >= value {
+                return S_OK;
+            }
+            tracing::warn!(value, "blocking fence wait timed out");
             return E_NOTIMPL;
         }
         // shortcut: a null event means "block until reached"; nothing can
@@ -125,8 +148,6 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         tracing::warn!(value, "blocking fence wait not implemented");
         return E_NOTIMPL;
     }
-    #[cfg(windows)]
-    crate::titletime::fence_event(event as usize);
     waiters.push((value, event as usize));
     S_OK
 }
@@ -144,6 +165,12 @@ pub(crate) fn set(this: This, value: u64) {
         }
         !reached
     });
+    drop(waiters);
+    #[cfg(windows)]
+    // SAFETY: wake any guest thread polling/blocking via WaitOnAddress on the fence's GPU VA.
+    unsafe {
+        windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const fence.value).cast());
+    }
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let _called = crate::timeline::span("a fence set");

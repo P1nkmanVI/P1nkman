@@ -47,27 +47,7 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || asked(n) || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
-}
-
-/// `VICTORY_CAPTURE_ON=<file>`: when that file appears it is removed, and the
-/// frame two after the one asked about then is listed: a script that walks
-/// the player somewhere asks for the frame there, whatever its number is in
-/// that run (the second frame on, so that all of it is recorded as listed).
-fn asked(n: u64) -> bool {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    static FILE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    static ASKED: AtomicU64 = AtomicU64::new(u64::MAX);
-    static LOOKED: AtomicU64 = AtomicU64::new(u64::MAX);
-    let Some(file) = FILE.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_ON").map(PathBuf::from)) else {
-        return false;
-    };
-    // Looked for once a frame number, not at every operation recorded.
-    if LOOKED.swap(n, Relaxed) != n && file.exists() && std::fs::remove_file(file).is_ok() {
-        ASKED.store(n + 2, Relaxed);
-        tracing::info!(frame = n + 2, "a frame asked for by the capture file");
-    }
-    ASKED.load(Relaxed) == n
+    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -394,66 +374,6 @@ pub(crate) fn note_target(resource: crate::object::This) {
     }
 }
 
-/// With `VICTORY_DUMP_DEPTH_READ=1` as well: a depth texture a program reads
-/// through a table is saved like a target (the lamps' cached shadow maps,
-/// which `shadowSmartBlit:CS_DepthCopy` copies into the frame's maps and
-/// nothing writes in the frame).
-pub(crate) fn note_read_depth(resource: crate::object::This) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| crate::switch::on("VICTORY_DUMP_DEPTH_READ")) {
-        return;
-    }
-    if crate::resource::host_copy(resource).is_some_and(|t| t.flags() & 2 != 0) {
-        note_target(resource);
-    }
-}
-
-/// With `VICTORY_DUMP_PED_TEXTURES=1` as well: the textures the title fills
-/// that a pixel program of its characters' G-buffer pass (`PS_DeferredPed*`)
-/// reads through a table, saved like targets (block-compressed ones as
-/// their level-0 blocks, `.bin`, which `scripts/bc-png.mjs` turns into
-/// pictures). Each is logged once with the title address it was placed at:
-/// a frame's ops lines name placed views by address, the files by resource.
-/// Whether the guard's arm, which shows a normal map's flat blue, samples a
-/// colour texture that holds a normal map (its bytes) or a normal map (the
-/// view), is told by these.
-pub(crate) fn note_ped_read(resource: crate::object::This, placed_at: Option<u64>) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| crate::switch::on("VICTORY_DUMP_PED_TEXTURES"))
-        || resource.is_null()
-        || !dump_on()
-    {
-        return;
-    }
-    let frame = crate::queue::presented() + 1;
-    if !listed(frame) {
-        return;
-    }
-    let Some(copy) = crate::resource::host_copy(resource).filter(|t| t.flags() & 0x7 == 0) else {
-        return;
-    };
-    let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    // (A frame's characters read a few hundred; more is something else.)
-    if targets.len() >= 1500 || targets.iter().any(|&(r, _)| r == resource as usize) {
-        return;
-    }
-    // SAFETY: a live resource.
-    let d = unsafe { copy.texture.GetDesc() };
-    tracing::info!(
-        frame,
-        index = targets.len(),
-        ?resource,
-        address = format_args!("{:#x}", placed_at.unwrap_or(0)),
-        width = d.Width,
-        height = d.Height,
-        format = d.Format.0,
-        levels = d.MipLevels,
-        title_level_of_level_0 = copy.base,
-        "a texture a character's G-buffer draw samples (saved with the frame's targets)"
-    );
-    targets.push((resource as usize, copy));
-}
-
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -468,60 +388,8 @@ pub(crate) fn dump_targets(frame: u64) {
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        dump_one(host, texture, state, frame, i, *resource as crate::object::This, 0);
-        // The slices after the first of a one-level 16-bit depth array (the
-        // lamps' shadow maps have three), each on its own.
-        if d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0
-            && matches!(d.Format.0, 53..=56)
-            && d.MipLevels == 1
-        {
-            for slice in 1..u32::from(d.DepthOrArraySize).min(8) {
-                dump_one(host, texture, state, frame, i, *resource as crate::object::This, slice);
-            }
-        }
+        dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
     }
-}
-
-/// Logs what a 16-bit depth plane read back holds: texels at 0 (nearest),
-/// at 0xffff (cleared far), the range and mean of the others and the most
-/// common values. (A lamp's shadow map that is 0 everywhere puts the lamp in
-/// full shadow.)
-fn depth16_values(rows: &[u8], pitch: usize, w: usize, h: usize, frame: u64, resource: crate::object::This, slice: u32) {
-    let (mut zero, mut far, mut low, mut high, mut sum, mut n) = (0u32, 0u32, u16::MAX, 0u16, 0f64, 0u32);
-    let mut values = std::collections::HashMap::<u16, u32>::new();
-    for y in 0..h {
-        for x in 0..w {
-            let at = y * pitch + x * 2;
-            let v = u16::from_le_bytes([rows[at], rows[at + 1]]);
-            *values.entry(v).or_default() += 1;
-            match v {
-                0 => zero += 1,
-                u16::MAX => far += 1,
-                v => {
-                    low = low.min(v);
-                    high = high.max(v);
-                    sum += f64::from(v);
-                    n += 1;
-                }
-            }
-        }
-    }
-    let mut most: Vec<(u16, u32)> = values.into_iter().collect();
-    most.sort_by_key(|e| std::cmp::Reverse(e.1));
-    most.truncate(8);
-    tracing::info!(
-        frame,
-        ?resource,
-        slice,
-        texels = w * h,
-        zero,
-        far,
-        low,
-        high,
-        mean = if n > 0 { sum / f64::from(n) } else { 0.0 },
-        ?most,
-        "16-bit depth values"
-    );
 }
 
 fn dump_one(
@@ -531,12 +399,8 @@ fn dump_one(
     frame: u64,
     i: usize,
     resource: crate::object::This,
-    slice: u32,
+    d: &D3D12_RESOURCE_DESC,
 ) {
-    // (Read here rather than passed in, which kept the arguments under
-    // clippy's limit: the caller's description of the same texture.)
-    // SAFETY: a live resource.
-    let d = &unsafe { texture.GetDesc() };
     let Ok(list) = host.new_list() else { return };
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -546,13 +410,12 @@ fn dump_one(
             list.list
                 .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
         }
-        let read = read_back_of(&host.device, &list.list, texture, slice);
+        let read = read_back(&host.device, &list.list, texture);
         // The stencil plane of a depth-stencil target, which the title's
         // lighting reads (material class in the low bits; 0x08 "inside a
         // room", which the lamps of a room are multiplied by): the plane
         // after the depth plane of a one-level, one-slice texture.
-        let stencil = (slice == 0
-            && matches!(d.Format.0, 19..=22 | 44..=47)
+        let stencil = (matches!(d.Format.0, 19..=22 | 44..=47)
             && d.MipLevels == 1
             && d.DepthOrArraySize == 1)
             .then(|| read_back_of(&host.device, &list.list, texture, 1))
@@ -578,36 +441,6 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
-        // Block-compressed (textures characters sample, `note_ped_read`):
-        // the blocks as they are, one row of blocks after another, for
-        // `scripts/bc-png.mjs`. (Their footprint has a row a block high: the
-        // mapping is shorter than the texel rows times the pitch.)
-        let block = match f.Format.0 {
-            70..=72 | 79..=81 => 8,
-            73..=78 | 82..=84 | 94..=99 => 16,
-            _ => 0,
-        };
-        if block > 0 {
-            let (across, down) = (f.Width.div_ceil(4) as usize * block, f.Height.div_ceil(4) as usize);
-            if down > 0
-                && let Some(folder) = folder()
-            {
-                let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * (down - 1) + across);
-                let mut raw = Vec::with_capacity(across * down);
-                for y in 0..down {
-                    raw.extend_from_slice(&rows[y * pitch..y * pitch + across]);
-                }
-                let path = folder.join(format!(
-                    "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}-s{slice}.bin",
-                    f.Width, f.Height, f.Format.0
-                ));
-                if let Err(e) = std::fs::write(&path, raw) {
-                    tracing::warn!(error = %e, path = %path.display(), "blocks not saved");
-                }
-            }
-            buffer.Unmap(0, None);
-            return;
-        }
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
         // A 24-bit depth plane comes back as 32-bit words: which depth values
         // (low 24 bits) and which top bytes it holds, the most common first.
@@ -629,49 +462,10 @@ fn dump_one(
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
-        // A 16-bit depth texture (typeless on the host) holds unorm depth,
-        // not half floats: shown and counted as such.
-        let depth16 = d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 && matches!(f.Format.0, 53..=56);
-        if depth16 {
-            depth16_values(rows, pitch, f.Width as usize, f.Height as usize, frame, resource, slice);
-        }
-        let format = if depth16 { 56 } else { f.Format.0 as u32 };
-        // `VICTORY_DUMP_RAW=1`: the texels as they are, row after row with
-        // no padding (`.bin` beside the picture; the PNG loses small integers
-        // and 16-bit depth): integer and depth formats only, at most 64 MB.
-        static RAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let bytes = match format {
-            41..=43 => 4,
-            53..=59 => 2,
-            60..=65 => 1,
-            _ => 0,
-        };
-        if *RAW.get_or_init(|| crate::switch::on("VICTORY_DUMP_RAW"))
-            && bytes > 0
-            && let Some(folder) = folder()
-        {
-            let row = f.Width as usize * bytes;
-            if row * (f.Height as usize) <= 64 << 20 {
-                let mut raw = Vec::with_capacity(row * f.Height as usize);
-                for y in 0..f.Height as usize {
-                    raw.extend_from_slice(&rows[y * pitch..y * pitch + row]);
-                }
-                let path = folder.join(format!(
-                    "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}-s{slice}.bin",
-                    f.Width, f.Height, f.Format.0
-                ));
-                if let Err(e) = std::fs::write(&path, raw) {
-                    tracing::warn!(error = %e, path = %path.display(), "raw texels not saved");
-                }
-            }
-        }
-        if let Some(rgba) = to_rgba(format, f.Width as usize, f.Height as usize, pitch, rows) {
+        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}{}",
-                d.Width,
-                d.Height,
-                d.Format.0,
-                if slice > 0 { format!("-s{slice}") } else { String::new() }
+                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
+                d.Width, d.Height, d.Format.0
             );
             save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
         } else {

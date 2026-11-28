@@ -129,11 +129,6 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
-    /// The title's barrier group calls by what they say of unordered
-    /// access: one ends, one only begins, none named.
-    GroupsEndWrites,
-    GroupsBeginWrites,
-    GroupsOther,
 }
 const COUNTERS: usize = 80;
 /// One of some sets of counters, each in lines of the processor's memory of
@@ -219,49 +214,15 @@ static WAITS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64)>>> = Mutex::new(No
 /// their microseconds, and the longest one's.
 static COMMANDS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex::new(None);
 
-/// Beside [`COMMANDS_BY_WORK`], by the same key: the groups of the commands
-/// whose note gives them (`dispatch XxYxZ`, `mesh X`), and the longest one's.
-/// A pipeline's time alone did not say whether a dispatch was slow for its
-/// size: `InstanceCullingCS_Tree_BatchCull` took 2-7 ms a dispatch in the
-/// prison, and the only frames listed (`VICTORY_CAPTURE_WORLD`) were the
-/// opening's, where it ran 2-36 groups for 0.02-0.05 ms.
-static GROUPS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex::new(None);
-
 /// A command took `ms` on the card (timing run). `op` is its note: the
 /// kind and size first, then the pipeline in brackets, then what it binds.
 pub(crate) fn command_took(op: &str, ms: f64) {
     let us = (ms * 1e3) as u64;
-    let key = command_key(op);
-    let longest = {
-        let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        let e = by.get_or_insert_with(HashMap::new).entry(key.clone()).or_insert((0, 0, 0));
-        e.0 += 1;
-        e.1 += us;
-        let longest = us >= e.2;
-        e.2 = e.2.max(us);
-        longest
-    };
-    if let Some(groups) = command_groups(op) {
-        let mut by = GROUPS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        let e = by.get_or_insert_with(HashMap::new).entry(key).or_insert((0, 0, 0));
-        e.0 += 1;
-        e.1 += groups;
-        if longest {
-            e.2 = groups;
-        }
-    }
-}
-
-/// The groups a command's note says it runs: `dispatch XxYxZ` (X·Y·Z) or
-/// `mesh X`; none for the others (an indirect command's count is on the
-/// card).
-fn command_groups(op: &str) -> Option<u64> {
-    let mut words = op.split(' ');
-    let size = match words.next()? {
-        "dispatch" | "mesh" => words.next()?,
-        _ => return None,
-    };
-    size.split('x').map(|n| n.parse::<u64>().ok()).product()
+    let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
+    let e = by.get_or_insert_with(HashMap::new).entry(command_key(op)).or_insert((0, 0, 0));
+    e.0 += 1;
+    e.1 += us;
+    e.2 = e.2.max(us);
 }
 
 /// What a command's note is summed under: its pipeline (`[compute ...]`,
@@ -301,16 +262,6 @@ pub(crate) fn card_waited(us: u64, what: impl FnOnce() -> String) {
     if us > longest.0 {
         *longest = (us, text);
     }
-}
-
-/// The barriers of the title's groups by `(kind, [sync before, sync after,
-/// access before, access after])`, counted.
-static GROUP_BARRIERS: Mutex<Option<HashMap<(u32, [u32; 4]), u64>>> = Mutex::new(None);
-
-/// A barrier of one of the title's groups.
-pub(crate) fn group_barrier(kind: u32, values: [u32; 4]) {
-    let mut seen = GROUP_BARRIERS.lock().unwrap_or_else(|e| e.into_inner());
-    *seen.get_or_insert_with(HashMap::new).entry((kind, values)).or_default() += 1;
 }
 
 /// Whether an experiment on barriers is on (`VICTORY_BARRIER_TEST`): bit 0
@@ -495,17 +446,6 @@ mod command_tests {
         );
         assert_eq!(command_key("texture upload 0x271b61c28b0 (2048x2048x1 f99 mips 10) sub 0"), "texture upload");
         assert_eq!(command_key("alias copy of 0x26f66aca780 into 0x26fbdc93890"), "alias copy");
-    }
-
-    /// Dispatches and mesh draws name their groups; other commands do not.
-    #[test]
-    fn commands_give_their_groups() {
-        use super::command_groups;
-        assert_eq!(command_groups("dispatch 3x1x1 [compute 55679a0547649d0b] | 55679a0547649d0b: u4=0xa00000"), Some(3));
-        assert_eq!(command_groups("dispatch 40x22x2 [compute 24f989b98dcb03f0]"), Some(1760));
-        assert_eq!(command_groups("mesh 86 [mesh f0c7efd2aceb2aaa, pixel 7d85c9cab3c80721]"), Some(86));
-        assert_eq!(command_groups("indirect kind 10 max 1 at 0xd9358fce0 [mesh 0750cb2d975c7563]"), None);
-        assert_eq!(command_groups("alias copy of 0x26f66aca780 into 0x26fbdc93890"), None);
     }
 }
 
@@ -1272,7 +1212,7 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "waits for the write trackers' locks per frame, all threads (number, time): {}",
-        crate::watch::lock_waits(frames)
+        crate::watch::lock_waits(frames as f64)
     );
     let [copies, blocks, opened, stores, unknown, full, stayed, copied_same, records] =
         [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|n| crate::titlewrite::DONE[n].load(std::sync::atomic::Ordering::Relaxed));
@@ -1395,19 +1335,9 @@ pub(crate) fn log(frames: f64) {
             text.join(", ")
         );
     }
-    let mut groups = GROUPS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     for (what, (n, us, longest)) in by.into_iter().take(40) {
-        // The groups after the line's usual text, which scripts read up to the pipeline.
-        let sizes = match groups.remove(&what) {
-            Some((counted, sum, of_longest)) if counted > 0 => format!(
-                "; {:.1} groups a command, {:.2} us a group, the longest {of_longest} groups",
-                sum as f64 / counted as f64,
-                us as f64 / sum.max(1) as f64
-            ),
-            _ => String::new(),
-        };
         tracing::info!(
-            "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}{sizes}",
+            "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
             us as f64 / 1e3 / frames,
             n as f64 / frames,
             longest as f64 / 1e3
@@ -1422,23 +1352,6 @@ pub(crate) fn log(frames: f64) {
         c[C::IndirectBounded as usize],
         barrier_test()
     );
-    tracing::info!(
-        "  the title's barrier group calls, per frame: {:.0} end an unordered access, {:.0} only begin one, \
-         {:.0} name none",
-        c[C::GroupsEndWrites as usize],
-        c[C::GroupsBeginWrites as usize],
-        c[C::GroupsOther as usize]
-    );
-    let barriers = GROUP_BARRIERS.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let mut barriers: Vec<_> = barriers.into_iter().flatten().collect();
-    barriers.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
-    for ((kind, [sync_before, sync_after, before, after]), n) in barriers.into_iter().take(24) {
-        tracing::info!(
-            "  barriers in groups: {:.1} a frame of kind {kind} (0 global, 1 texture, 2 buffer), sync \
-             {sync_before:#x} -> {sync_after:#x}, access {before:#x} -> {after:#x}",
-            n as f64 / frames
-        );
-    }
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();

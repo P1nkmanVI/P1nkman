@@ -122,7 +122,7 @@ pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -184,20 +184,6 @@ pub fn group_sync() -> u8 {
     })
 }
 
-/// Whether a compute program's atomic adds whose result nothing reads are summed over the
-/// host wave where every lane that runs one names the same word, and added by one lane
-/// (`VICTORY_WAVE_ATOMICS=1`; off by default). The title's culling programs count with them
-/// in their innermost loops, every lane of a wave to one counter (`InstanceCulling
-/// CS_Tree_BatchCull`: some 50 such instructions): a wave of 32 lanes then makes 32 atomic
-/// operations on one word, one after the other, and where that word is in memory shared
-/// with the PC (title memory used in place) each crosses the bus. The sum is the same;
-/// lanes that name different words add their own as before. Part of the translation: the
-/// shader cache keys on it.
-pub fn wave_atomics() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_ATOMICS").is_some_and(|v| v == "1"))
-}
-
 /// Whether buffer atomics of the ray-tracing structure builder stand between
 /// two fences (`VICTORY_BVH_FENCES=0`: they do not). Part of the
 /// translation: the shader cache keys on it.
@@ -213,25 +199,6 @@ pub fn builder_fences() -> bool {
 pub fn builder_bounds() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_none_or(|v| v != "0"))
-}
-
-/// Whether the ray-tracing node test answers "nothing hit" for every node
-/// (`VICTORY_RT_MISS=1`; off by default): a box node's four children are
-/// none and a triangle node is a miss, so every traversal ends at its root.
-///
-/// For runs without the structure builder, or while its structures are
-/// wrong: the title's local-light shadow rays then hit nothing (lit, as
-/// with no occluder, in place of black or speckled faces), its reflection
-/// and probe rays reach the sky, and the trace programs cost next to
-/// nothing on the card. The sun's near shadows are the title's cascades
-/// and stay. shortcut: no lamp casts a shadow; drop it once the structures
-/// are right.
-///
-/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
-/// does).
-pub fn rt_miss() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RT_MISS").is_some_and(|v| v == "1"))
 }
 
 /// The clean-up passes that run over a translated program before it is
@@ -387,21 +354,6 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
-    /// Table descriptors (root parameter, dword offset in the table) whose
-    /// buffer the shader reads or writes sixteen bits a channel
-    /// (`buffer_load_format_d16_*`, `buffer_store_format_d16_*`), in
-    /// order. On the console each channel's 16 bits move as they are
-    /// through a 16-bit float view and through a 16-bit integer one alike
-    /// (the title keeps half floats, and indices beside them, in
-    /// `R16G16B16A16_UINT` and `R16_UINT` buffers). The DXIL moves them as
-    /// unsigned integers, which an unsigned 16-bit view carries unchanged;
-    /// the host shows the shader a 16-bit float or signed buffer view at
-    /// these places as the unsigned format of the same layout.
-    /// shortcut: a view in a normalised 16-bit format, whose values the
-    /// console would convert to halves, is read as its integers; a
-    /// descriptor picked at run time keeps the float path (its slot, and so
-    /// its format, is known only then).
-    pub half_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -429,23 +381,6 @@ pub struct UserData {
     pub root: RootType,
     /// Dword within the parameter.
     pub dword: u32,
-}
-
-thread_local! {
-    /// See [`with_wide_first`].
-    static WIDE_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Runs `f` (a translation) with the exact wave-wide form tried before the approximate ones for
-/// this program, as `VICTORY_WAVE_WIDE=1` has it for every program. With that switch on for all
-/// of them a run lost the card as the world started (a group barrier some thread never reaches),
-/// so the caller names the programs one by one (`VICTORY_WAVE_WIDE_FOR`): the title's light
-/// clustering, which the approximate form gives each half of its cells only half of the lights.
-pub fn with_wide_first<R>(on: bool, f: impl FnOnce() -> R) -> R {
-    let was = WIDE_FIRST.replace(on);
-    let r = f();
-    WIDE_FIRST.set(was);
-    r
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -520,8 +455,6 @@ pub fn emit(
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
-        // (the blocks the program as it is wanted every lane in)
-        let mut base_needs = lower::take_needs();
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
@@ -552,191 +485,49 @@ pub fn emit(
         };
         // The program in two other forms: without its early-outs, and
         // without any branch that only skips code no lane is left for.
-        let form = |p: Option<ir::Program>| {
-            // (`VICTORY_WAVE_WHY=1` says what kept a form from being tried)
+        let form = |label: &str, p: Option<ir::Program>| {
             let Some(p) = p else {
                 if why {
-                    eprintln!("WAVE64-RETRY a form the program does not have");
+                    eprintln!("WAVE64-FORM {label}: ir returned None");
                 }
                 return None;
             };
-            let said = |what: &str, e: &ShaderError| {
-                if why {
-                    eprintln!("WAVE64-RETRY a form not tried, {what}: {e}");
+            let st = match structure::structure(&p) {
+                Ok(st) => st,
+                Err(e) => {
+                    if why {
+                        eprintln!("WAVE64-FORM {label}: structure failed: {e}");
+                    }
+                    return None;
                 }
             };
-            let st = structure::structure(&p).inspect_err(|e| said("its structure", e)).ok()?;
-            let io = io::raise(&p, native).inspect_err(|e| said("its inputs and outputs", e)).ok()?;
-            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).inspect_err(|e| said("its resources", e)).ok()?;
+            let io = match io::raise(&p, native) {
+                Ok(io) => io,
+                Err(e) => {
+                    if why {
+                        eprintln!("WAVE64-FORM {label}: io::raise failed: {e}");
+                    }
+                    return None;
+                }
+            };
+            let res = match resource::track(&p, &native.layout, native.stage, Some(&st)) {
+                Ok(res) => res,
+                Err(e) => {
+                    if why {
+                        eprintln!("WAVE64-FORM {label}: resource::track failed: {e}");
+                    }
+                    return None;
+                }
+            };
             Some((p, st, io, res))
         };
         let forms = [
-            ("without early-outs", form(ir::without_early_outs(p))),
-            ("without skips", form(ir::without_skips(p, false))),
+            ("without early-outs", form("without early-outs", ir::without_early_outs(p))),
+            ("without skips", form("without skips", ir::without_skips(p, false))),
         ];
-        // The program as it is, its early-outs taken by a host wave together as the console
-        // takes them by the wave ([`structure::structure_wide`]): for the forms in which each
-        // host wave is a wave of its own, tried there before the forms without early-outs. In
-        // those a host wave with no lane left walks the whole body with EXEC clear; the
-        // scalars it reads from its first lane are then whatever that lane last held, and a
-        // loop counted by one runs to the iteration limit (the title's
-        // `InstanceCullingCS_Tree_BatchCull`: a dispatch of a few groups took the card
-        // milliseconds). `VICTORY_WAVE_EARLY_OUTS=0`: not tried.
-        let early = std::env::var_os("VICTORY_WAVE_EARLY_OUTS").is_none_or(|v| v != "0").then(|| {
-            let outs: std::collections::HashSet<usize> = ir::early_outs(p).into_iter().collect();
-            if outs.is_empty() {
-                return None;
-            }
-            let st = structure::structure_wide(p, &outs).ok()?;
-            let io = io::raise(p, native).ok()?;
-            let res = resource::track(p, &native.layout, native.stage, Some(&st)).ok()?;
-            Some((st, io, res))
-        });
-        let early = early.flatten();
-        // Only the skips around the code that needs every lane left out, before every pure skip
-        // of the program is ([`ir::without_some_skips`]): the program without its early-outs
-        // names the blocks it wanted every lane in (`lower::take_needs`), the pure skips whose
-        // regions hold them are left out, and so on until it translates for waves of 32 or no
-        // such skip is left. Without skips every lane walks every skipped region with EXEC
-        // clear, where most of the title's large lighting and culling programs only need it in
-        // a few. As exact as the form without skips: a skip left out is one that form leaves
-        // out too, judged in the program as it is (the code after it sees no scalar the region
-        // changed), and a skip that stays is taken lane by lane as before, around code with no
-        // meeting of the host waves in it. `VICTORY_WAVE_SELECTIVE_SKIPS=0`: not tried (on by
-        // default).
-        let selective_on = std::env::var_os("VICTORY_WAVE_SELECTIVE_SKIPS").is_none_or(|v| v != "0");
-        // In the forms whose host waves exchange (the ones above without early-outs) a console
-        // wave none of whose lanes is left still walks the whole body with EXEC clear, its two
-        // host waves meeting at every exchange. Where a thread group is that one console wave
-        // (64 threads) its early-outs are kept and taken by the console wave instead
-        // ([`structure::structure_wide`]): the two host waves exchange whether some lane of
-        // theirs stays (`Lower::wave_wide`) and leave together when none does, as the console
-        // wave leaves. Only early-outs in blocks every lane runs and behind no scalar branch:
-        // the exchange is itself a meeting, which both host waves must reach, and they leave
-        // only together, so no barrier after it waits for threads that left (in a group of
-        // several console waves one could leave while the others meet, so those stay as they
-        // are). The others are left out as before. Tried before each form without
-        // early-outs, which follows if it does not translate.
-        // `VICTORY_WAVE_EARLY_OUTS_EXCHANGE=0`: not tried (on by default).
-        let one_wave = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64);
-        let outs_on = one_wave && std::env::var_os("VICTORY_WAVE_EARLY_OUTS_EXCHANGE").is_none_or(|v| v != "0");
-        let all_outs: std::collections::HashSet<usize> =
-            if outs_on { ir::early_outs(p).into_iter().collect() } else { Default::default() };
-        let by_wave = |name: &str, deep: bool, skips: Option<&std::collections::HashSet<usize>>| {
-            if all_outs.is_empty() {
-                return None;
-            }
-            let pure: std::collections::HashSet<usize>;
-            let skips = match skips {
-                Some(s) => s,
-                None => {
-                    pure = ir::pure_skips(p, deep).into_iter().collect();
-                    &pure
-                }
-            };
-            let mut outs = all_outs.clone();
-            let (q, st) = loop {
-                if outs.is_empty() {
-                    return None;
-                }
-                let q = ir::without_some_skips(p, deep, skips, &outs).unwrap_or_else(|| p.clone());
-                let st = structure::structure_wide(&q, &outs).ok()?;
-                let all = lower::all_lane_blocks(&st)?;
-                let mut bad = Vec::new();
-                for &b in &outs {
-                    if !all.get(b).copied().unwrap_or(false) || !lower::scalar_branches_around(&st, &[b])?.is_empty() {
-                        bad.push(b);
-                    }
-                }
-                if bad.is_empty() {
-                    break (q, st);
-                }
-                for b in bad {
-                    outs.remove(&b);
-                }
-            };
-            let io = io::raise(&q, native).ok()?;
-            let res = resource::track(&q, &native.layout, native.stage, Some(&st)).ok()?;
-            lower::take_needs();
-            let again = emit_program(c, native, &q, &st, &io, &res);
-            lower::take_needs();
-            let name = if name.is_empty() {
-                "early-outs by the console wave".to_owned()
-            } else {
-                format!("{name}, early-outs by the console wave")
-            };
-            report(&name, &again);
-            if why && done(&again) {
-                eprintln!("WAVE64-OUTS {name}: {} of {} early-outs taken by the console wave", outs.len(), all_outs.len());
-            }
-            done(&again).then_some(again)
-        };
-        let selective = |deep: bool, base: &structure::Structured, needs: &[usize]| {
-            let name = if deep { "without skips where needed, scalars followed" } else { "without skips where needed" };
-            let skips: std::collections::HashSet<usize> = ir::pure_skips(p, deep).into_iter().collect();
-            let kept = std::collections::HashSet::new();
-            let mut chosen = std::collections::HashSet::new();
-            let mut around = lower::lane_branches_around(base, needs)?;
-            loop {
-                let before = chosen.len();
-                chosen.extend(around.into_iter().filter(|d| skips.contains(d)));
-                // (all of them: that is the form without skips, which comes next)
-                if chosen.len() == before || chosen.len() == skips.len() {
-                    if why {
-                        eprintln!("WAVE64-RETRY {name}: stopped with {} of {} skips left out", before, skips.len());
-                    }
-                    return None;
-                }
-                if let Some(again) = by_wave(name, deep, Some(&chosen)) {
-                    return Some(again);
-                }
-                let (q, st, io, res) = form(ir::without_some_skips(p, deep, &chosen, &kept))?;
-                lower::take_needs();
-                let again = emit_program(c, native, &q, &st, &io, &res);
-                let needs = lower::take_needs();
-                report(name, &again);
-                if done(&again) {
-                    if why {
-                        // what the skips that stay save: the instructions a host wave with no
-                        // lane for them leaves out, here and in the form without skips
-                        let all = form(ir::without_skips(p, deep));
-                        let under = lower::under_lane_branches(&q, &st);
-                        let before = all.as_ref().and_then(|f| lower::under_lane_branches(&f.0, &f.1));
-                        eprintln!(
-                            "WAVE64-SELECTIVE {name}: {} of {} skips left out; instructions under per-lane branches {:?} (without skips {:?})",
-                            chosen.len(),
-                            skips.len(),
-                            under,
-                            before
-                        );
-                    }
-                    return Some(again);
-                }
-                if needs.is_empty() {
-                    return None;
-                }
-                around = lower::lane_branches_around(&st, &needs)?;
-            }
-        };
-        for (i, (name, f)) in forms.iter().enumerate() {
-            if i == 1 && selective_on {
-                let base = forms[0].1.as_ref().map_or(st, |f| &f.1);
-                if let Some(again) = selective(false, base, &base_needs) {
-                    return again.map(|(shader, _)| shader);
-                }
-            }
-            if f.is_some() {
-                let none = std::collections::HashSet::new();
-                if let Some(again) = by_wave(if i == 0 { "" } else { name }, false, (i == 0).then_some(&none)) {
-                    return again.map(|(shader, _)| shader);
-                }
-            }
+        for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
-                lower::take_needs();
                 let again = emit_program(c, native, p, st, io, res);
-                if i == 0 {
-                    base_needs = lower::take_needs();
-                }
                 report(name, &again);
                 if done(&again) {
                     return again.map(|(shader, _)| shader);
@@ -748,14 +539,24 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        // (or for this program alone: [`with_wide_first`])
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_FIRST.get();
-        let wide_form = |deep: Option<&ir::Program>| {
-            let bases = [deep, forms[1].1.as_ref().map(|f| &f.0), forms[0].1.as_ref().map(|f| &f.0), Some(p)];
-            let again = widen(c, native, bases.into_iter().flatten().next().expect("the program itself"), why);
-            report("wave-wide branches", &again);
-            again
-        };
+        let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
+        // Both archived kernels use one logical wave per group and have
+        // validated wave32 PSOs on RTX. Explicit policy wins.
+        let scene_kernel = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+            && matches!(
+                c.digest,
+                [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
+                    | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
+            );
+        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        // A single guest wave can iterate an active-lane loop until both host
+        // halves have finished. The precise latch and convergence conditions
+        // for the driver compute route are checked by widen().
+        let driver_loop = wide_option.is_none()
+            && c.part(FourCC::DXIL).is_none()
+            && c.part(FourCC::ACCC).is_some()
+            && matches!(&original, Err(ShaderError::Unsupported { what, .. })
+                if *what == lower::DIVERGENT_MASK_EXCHANGE);
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -766,19 +567,7 @@ pub fn emit(
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-                // (first only those around the code that needs every lane, as above)
-                if deep_on && selective_on {
-                    let base = forms[0].1.as_ref().map_or(st, |f| &f.1);
-                    if let Some(again) = selective(true, base, &base_needs) {
-                        return again.map(|(shader, _)| shader);
-                    }
-                }
-                let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
-                if deep.is_some()
-                    && let Some(again) = by_wave("without skips, scalars followed", true, None)
-                {
-                    return again.map(|(shader, _)| shader);
-                }
+                let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
@@ -789,10 +578,19 @@ pub fn emit(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on {
-                    let again = wide_form(deep.as_ref().map(|f| &f.0));
-                    if done(&again) {
-                        return again.map(|(shader, _)| shader);
+                if wide_on || driver_loop {
+                    let bases = [
+                        deep.as_ref().map(|f| &f.0),
+                        forms[1].1.as_ref().map(|f| &f.0),
+                        forms[0].1.as_ref().map(|f| &f.0),
+                        Some(p),
+                    ];
+                    if let Some(base) = bases.into_iter().flatten().next() {
+                        let again = widen(c, native, base, why, driver_loop);
+                        report("wave-wide branches", &again);
+                        if done(&again) {
+                            return again.map(|(shader, _)| shader);
+                        }
                     }
                 }
                 if strict {
@@ -801,15 +599,6 @@ pub fn emit(
             }
             if !local_on || exact_only {
                 continue;
-            }
-            if let Some((st, io, res)) = &early
-                && idiom(p, st) == exact
-            {
-                let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
-                report(&format!("local waves ({}), early-outs by the wave", if exact { "idiom" } else { "APPROXIMATE" }), &local);
-                if done(&local) {
-                    return local.map(|(shader, _)| shader);
-                }
             }
             for (name, f) in &forms {
                 if let Some((p, st, io, res)) = f
@@ -833,13 +622,6 @@ pub fn emit(
         if local_on && !exact_only {
             // Last: every mask and lane read per host wave.
             if !strict {
-                if let Some((st, io, res)) = &early {
-                    let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
-                    report("local waves (APPROXIMATE, any mask), early-outs by the wave", &local);
-                    if done(&local) {
-                        return local.map(|(shader, _)| shader);
-                    }
-                }
                 for (name, f) in &forms {
                     if let Some((p, st, io, res)) = f {
                         let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
@@ -856,20 +638,6 @@ pub fn emit(
                 }
             }
         }
-        // Last of all, for a program that would still ask for 64-lane waves, which this host
-        // refuses outright: the wave-wide form after all (unless `VICTORY_WAVE_WIDE=0`). Every
-        // group barrier it adds now stands behind decisions the two host waves take as one
-        // ([`widen`]). Not before the forms above: the programs they take keep their
-        // translation.
-        let wide_last = !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
-        if wide_last && matches!(&original, Ok((_, Some(64)))) {
-            let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-            let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
-            let again = wide_form(deep.as_ref().map(|f| &f.0));
-            if done(&again) {
-                return again.map(|(shader, _)| shader);
-            }
-        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
@@ -880,7 +648,7 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -888,7 +656,23 @@ pub fn emit(
         }
         other => other,
     };
-    let original = original.map(|(shader, _)| shader);
+    let supported = |(shader, wave): (HostShader, Option<u32>)| {
+        if wave == Some(64) && lower::host_max_wave() == 32 {
+            let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
+            if let Ok((s, w)) = local
+                && w != Some(64)
+            {
+                return Ok(s);
+            }
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "no wave32 lowering for this wave64 program",
+            })
+        } else {
+            Ok(shader)
+        }
+    };
+    let original = original.and_then(supported);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -902,7 +686,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program(c, native, &p, &st, &io, &res).and_then(supported)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -917,6 +701,7 @@ fn widen(
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
+    active_loop_only: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -934,56 +719,37 @@ fn widen(
         }
         _ => return Err(NOT),
     }
-    // (two host waves for a console wave: see [`lower::with_loop_exits`])
-    if native.wave64 && lower::host_max_wave() == 32 {
-        return lower::with_loop_exits(|| widen_from(c, native, p, why));
-    }
-    widen_from(c, native, p, why)
-}
-
-fn widen_from(
-    c: &Container,
-    native: &NativeProgram,
-    p: &ir::Program,
-    why: bool,
-) -> Result<(HostShader, Option<u32>), ShaderError> {
     let mut wide = std::collections::HashSet::new();
-    // The scalar branches the two host waves take as one ([`lower::with_agreed`]): every one
-    // around a place where the waves meet, so that no group barrier of the translation stands
-    // behind a decision the halves make each for themselves.
-    let mut agreed = std::collections::HashSet::new();
     loop {
         let st = structure::structure_wide(p, &wide)?;
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
-        lower::take_meets();
-        let r = lower::with_agreed(&agreed, || emit_program(c, native, p, &st, &io, &res));
+        let r = emit_program(c, native, p, &st, &io, &res);
         let needs = lower::take_needs();
-        let meets = lower::take_meets();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
         let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
             || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
         if !stuck {
-            if r.is_ok() && !meets.is_empty() {
-                // (a meeting in a block that could not be named, or an indirect exit: not known)
-                let around = lower::scalar_branches_around(&st, &meets).filter(|_| !meets.contains(&usize::MAX));
-                let Some(around) = around else {
-                    return Err(ShaderError::Unsupported {
-                        offset: 0,
-                        what: "wave-wide branches whose meetings of host waves cannot be placed",
-                    });
-                };
-                let before = agreed.len();
-                agreed.extend(around);
-                if agreed.len() > before {
-                    continue;
-                }
-            }
             if why {
-                eprintln!("WAVE64-WIDE {} branches taken wave-wide, {} scalar branches agreed on", wide.len(), agreed.len());
+                let order = ir::reverse_postorder(&p.blocks);
+                let mut rpo = vec![0usize; p.blocks.len()];
+                for (i, &b) in order.iter().enumerate() {
+                    rpo[b] = i;
+                }
+                let mut sorted: Vec<usize> = wide.iter().copied().collect();
+                sorted.sort_unstable();
+                let desc: Vec<String> = sorted
+                    .iter()
+                    .map(|&b| {
+                        let back = matches!(p.blocks[b].exit, ir::Exit::Branch { taken, not_taken } if rpo[taken] <= rpo[b] || rpo[not_taken] <= rpo[b]);
+                        let nm = p.blocks[b].insts.last().map_or("?", |i| i.name());
+                        format!("B{b}({nm}{})", if back { ",BACK" } else { "" })
+                    })
+                    .collect();
+                eprintln!("WAVE64-WIDE {} branches taken wave-wide: [{}]", wide.len(), desc.join(", "));
             }
             return r;
         }
@@ -997,6 +763,30 @@ fn widen_from(
                 eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
             }
             return r;
+        }
+        if active_loop_only {
+            // Only a single backward branch on the SCC just set by
+            // s_andn2_wrexec_b64. This instruction restricts EXEC to the
+            // unfinished lanes. The guest repeats the loop if *either*
+            // half still has work, while individual vector writes retain
+            // their EXEC predicates.
+            let [latch] = more.as_slice() else {
+                return r;
+            };
+            let block = &p.blocks[*latch];
+            let [.., update, branch] = block.insts.as_slice() else {
+                return r;
+            };
+            if !wide.is_empty()
+                || update.name() != "s_andn2_wrexec_b64"
+                || branch.name() != "s_cbranch_scc1"
+                || !matches!(
+                    block.exit,
+                    ir::Exit::Branch { taken, not_taken } if taken <= *latch && not_taken > *latch
+                )
+            {
+                return r;
+            }
         }
         wide.extend(more);
     }
@@ -1107,7 +897,6 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
-        half_views: l.half_views,
     };
     Ok((shader, wave_size))
 }
@@ -1890,7 +1679,6 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
-            half_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1903,7 +1691,6 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
-                half_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2513,7 +2300,6 @@ mod tests {
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
-            half_views: Vec::new(),
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
@@ -2667,7 +2453,6 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
-                half_views: l.half_views,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -3084,7 +2869,6 @@ mod barycentric_tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
-            half_views: Vec::new(),
         };
         validate(&vs);
         // One triangle covers an 8x8 target, with attribute values 2, 6, 10.

@@ -9,8 +9,6 @@ mod inspect;
 mod replay;
 mod run;
 mod shader;
-#[cfg(windows)]
-mod title_patch;
 mod translate;
 #[cfg(windows)]
 mod warm;
@@ -22,7 +20,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
-    name = "P1nkman",
+    name = "victory",
     version,
     about = "Run an Xbox Series title natively on Windows"
 )]
@@ -32,8 +30,6 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
-// Parsed once at start: a large variant costs nothing worth a box.
-#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
     Inspect {

@@ -20,11 +20,6 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 /// `skip`: the branch past the body when no thread is below s0: `s_cbranch_execz`, or
 /// `s_cbranch_scc0` on the SCC `s_and_saveexec` sets ("some lane is left").
 fn program(skip: u32) -> NativeProgram {
-    native(&words(skip))
-}
-
-/// [`program`]'s code.
-fn words(skip: u32) -> Vec<u32> {
     let mut words = vec![
         0x7E0A_0281, // v_mov_b32 v5, 1
         0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
@@ -40,7 +35,7 @@ fn words(skip: u32) -> Vec<u32> {
         0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
         0xBEFE_040C, // s_mov_b64 exec, s[12:13]
     ]);
-    words
+    native(&words)
 }
 
 /// A wave64 compute program of 64 threads (one console wave; the thread index in v0) with 4
@@ -147,7 +142,6 @@ fn lowered_counted(
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
-        half_views: lowered.half_views,
     })
 }
 
@@ -287,7 +281,6 @@ fn on_64_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
-        half_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -744,118 +737,86 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
     }
 }
 
-/// The block of `p` closed by the branch `name`.
-fn closed_by(p: &ir::Program, name: &str) -> usize {
-    (0..p.blocks.len())
-        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == name))
-        .unwrap_or_else(|| panic!("no {name}"))
-}
-
-/// [`program`] behind `if (s1 != 0)`: the two host waves meet inside a branch each of them
-/// decides from its own copy of s1. Were the copies to differ, one half would wait at a group
-/// barrier for the other; so the halves take the lower half's test, exchanged like any other
-/// value, and the place where they exchange it has no such branch around it in turn.
+/// Tarefa S1: a wave64 compute program with 64 threads whose LDS read and write
+/// both sit inside the same per-lane branch (`lds_meetings` returns `None`): the
+/// exact first pass keeps `wave_size = Some(64)` so exact retry stages still run,
+/// and the `with_local_waves_any` fallback lowers it cleanly to `wave_size = Some(32)`
+/// using a fence-only barrier on the divergent LDS accesses (never deadlocking)
+/// while unrelated unsupported exposure/tone-mapping wave64 constructs still stay
+/// rejected.
 #[test]
-fn a_scalar_branch_around_a_meeting_of_host_waves_is_agreed_on() {
-    let mut code = vec![
-        0xBF06_8001, // s_cmp_eq_u32 s1, 0
-        0xBF85_0000 | 30, // s_cbranch_scc1 past the body
+fn divergent_lds_read_write_wave64_lowers_to_wave32_without_deadlock() {
+    // if (v0 < s0) { lds[v0 * 4] = v0 + 1; v5 = lds[v0 * 4]; uav[v0] = v5; }
+    let words = [
+        0x340C_0082, // v_lshlrev_b32 v6, 2, v0 (byte offset in LDS)
+        0x4A0E_0081, // v_add_nc_u32 v7, 1, v0
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0006, // s_cbranch_execz +6 dwords -> restore EXEC
+        0xD834_0000, 0x0000_0706, // ds_write_b32 v6, v7
+        0xD8D8_0000, 0x0500_0006, // ds_read_b32 v5, v6
+        0xE070_1000, 0x8002_0506, // buffer_store_dword v5, v6, s[8:11], 0 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
     ];
-    code.extend(words(0xBF88_0000));
-    assert_eq!(code.len(), 32);
-    let native = native(&code);
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let (scalar, lane) = (closed_by(&p, "s_cbranch_scc1"), closed_by(&p, "s_cbranch_execz"));
-    let wide = HashSet::from([lane]);
-    let st = structure::structure_wide(&p, &wide).expect("structure");
-    lower::take_meets();
-    let each = lowered(&native, &p, &wide).expect("lower");
-    let meets = lower::take_meets();
-    // the wave-wide decision and the OR are exchanged inside the scalar branch
-    assert!(!meets.is_empty() && !meets.contains(&scalar), "{meets:?}");
-    assert_eq!(lower::scalar_branches_around(&st, &meets), Some(vec![scalar]));
-    let agreed = HashSet::from([scalar]);
-    let shader = lower::with_agreed(&agreed, || lowered(&native, &p, &wide)).expect("lower");
-    let meets = lower::take_meets();
-    // one more meeting, in the scalar branch's own block (here the entry block, which every
-    // thread runs): no further scalar branch is around a meeting
-    assert_eq!(lower::scalar_branches_around(&st, &meets), Some(vec![scalar]));
-    assert_ne!(each.dxil, shader.dxil);
+    let mut prog = native(&words);
+    if let StageIo::Cs(ref mut cs) = prog.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes (128 dwords) of LDS
+    }
+    let p = ir::build(&prog.code, prog.wave64, prog.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &prog.layout, prog.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &prog).expect("io::raise");
+    let parts = lower::Parts {
+        native: &prog,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    };
+
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    // Exact pass must still report wave_size=Some(64) so exact retry passes are not bypassed.
+    let exact = lower::lower(&parts).expect("exact lower");
+    assert_eq!(exact.wave_size, Some(64));
+
+    // S1 fallback lowers safely to WaveSize(32) with fence-only divergent LDS.
+    let approx = lower::with_local_waves_any(|| lower::lower(&parts)).expect("approx wave32 lower");
+    lower::TEST_HOST_WAVE.set(was);
+    assert_eq!(approx.wave_size, Some(32));
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: approx.dxil,
+        user_data: approx.user_data,
+        samplers: approx.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: approx.root_cbvs,
+        root_srvs: approx.root_srvs,
+        root_uavs: approx.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
     }
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    // (threads below s0 take the lane branch and OR their bits; nothing is stored with s1 = 0)
-    for (below, s1, expected) in [(40u32, 1u32, 0x000F_FFFF), (40, 0, 0), (64, 5, u32::MAX), (1, 1, 1), (33, 0, 0)] {
-        let Some(got) = on_the_card(&shader, [below, s1]) else { return };
-        assert_eq!(got, expected, "{below} threads in the branch, s1 = {s1}");
+    let Ok(host) = Host::new(true) else { return };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else { return };
+    // Run with partial wave active (17 < 64) to prove no divergent barrier deadlock on RTX.
+    let result = host
+        .dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(vec![17, 0, 0, 0]))],
+            views: &[View::RawUav(64)],
+            samplers: &[],
+            groups: [1, 1, 1],
+        })
+        .expect("dispatch must not deadlock");
+    for lane in 0..64u32 {
+        let expected = if lane < 17 { lane + 1 } else { 0 };
+        assert_eq!(result[0][lane as usize], expected, "lane {lane}");
     }
-    eprintln!("ran on the hardware device: both halves follow one test of s1");
-}
-
-/// A loop the lanes leave one by one, at the branch closing the block that holds a wave OR:
-/// `do { s1 += WaveActiveBitOr(bit); s0 -= 1; } while (thread < s0)`. From the second
-/// iteration on only the lanes still looping reach that block, so the two host waves cannot
-/// meet there (a group barrier would wait for the lanes that left) until the loop's branch is
-/// taken wave-wide: every lane then stays for as long as some lane loops, as on the console.
-#[test]
-fn a_loop_lanes_leave_one_by_one_is_taken_wave_wide_before_host_waves_meet_in_it() {
-    let mut code = vec![
-        0x7E0A_0281, // v_mov_b32 v5, 1
-        0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
-        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
-        0xBE8C_047E, // s_mov_b64 s[12:13], exec
-    ];
-    code.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
-    code.extend_from_slice(&[
-        0x8001_0701, // s_add_u32 s1, s1, s7
-        0x8080_8100, // s_sub_u32 s0, s0, 1
-        0x7DA8_0000, // v_cmpx_gt_u32 exec, s0, v0
-        0xBF89_0000 | 0xFFE8, // s_cbranch_execnz to the wave OR (24 words back)
-        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
-        0x7E00_0201, // v_mov_b32 v0, s1
-        0x38 << 26 | 0x1C << 18,
-        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
-    ]);
-    let native = native(&code);
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let names: Vec<&str> = p.blocks.iter().flat_map(|b| &b.insts).map(|i| i.name()).collect();
-    for name in ["s_add_u32", "s_sub_u32", "v_cmpx_gt_u32", "s_cbranch_execnz"] {
-        assert!(names.contains(&name), "{name} in {names:?}");
-    }
-    let head = closed_by(&p, "s_cbranch_execnz");
-    assert!(p.blocks[head].insts.iter().any(|i| i.name() == "v_readlane_b32"), "the OR is in the loop's block");
-    assert!(matches!(p.blocks[head].exit, ir::Exit::Branch { taken, .. } if taken == head), "{:?}", p.blocks[head].exit);
-    let st = structure::structure(&p).expect("structure");
-    // (taken, round again, when some lane's bit is set)
-    assert_eq!(st.wave_any[head], Some(true));
-    lower::with_loop_exits(|| {
-        // per lane, the block is one only some lanes run once it has come round
-        lower::take_needs();
-        let per_lane = lowered(&native, &p, &HashSet::new());
-        assert!(
-            matches!(&per_lane, Err(ShaderError::Unsupported { what, .. }) if lower::needs_every_lane(what)),
-            "{:?}",
-            per_lane.err()
-        );
-        let needs = lower::take_needs();
-        assert_eq!(needs, vec![head]);
-        assert_eq!(lower::branches_around(&st, &needs), Some(vec![head]));
-        // wave-wide, every lane runs it every time; the halves meet there with no scalar branch
-        // around them
-        let wide = HashSet::from([head]);
-        let st = structure::structure_wide(&p, &wide).expect("structure");
-        lower::take_meets();
-        let shader = lowered(&native, &p, &wide).expect("lower");
-        let meets = lower::take_meets();
-        assert!(meets.contains(&head), "{meets:?}");
-        assert_eq!(lower::scalar_branches_around(&st, &meets), Some(Vec::new()));
-        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-            let mut copy = shader.dxil.clone();
-            v.validate(&mut copy).expect("DXIL validation failed");
-        }
-    });
-    // (the other forms keep the block as one every lane runs: see `lower::with_loop_exits`)
-    assert_eq!(lower::branches_around(&st, &[head]), Some(Vec::new()));
 }

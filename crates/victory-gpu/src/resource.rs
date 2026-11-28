@@ -101,7 +101,6 @@ pub(crate) struct ResourceDesc {
 #[cfg(windows)]
 impl ResourceDesc {
     /// The texture of this one's levels from `base` on.
-    #[allow(clippy::wrong_self_convention)]
     fn from_level(&self, base: u32) -> ResourceDesc {
         let mut d = *self;
         if base > 0 {
@@ -1266,6 +1265,41 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
+/// Multi-level resolution-scaled selective mip drop active in VRAM Stage 2
+/// (`Alert`, >= 75%) and Stage 3 (`Critical`, >= 85%):
+/// - Large 2D scenery textures (`> 1024 px`, 2K/4K): `+2` mips in `Alert`, `+3` mips in `Critical`.
+/// - Medium 2D scenery textures (`> 256 px` up to `1024 px`): `+1` mip in `Alert`, `+2` mips in `Critical`.
+/// - Small textures (`<= 256 px`), UI (`mip_levels <= 1`), and render targets (`!fills(desc)`):
+///   `0` drop (100% native resolution preserved in every stage).
+#[cfg(windows)]
+pub(crate) fn selective_mip_drop(
+    desc: &ResourceDesc,
+    first: u32,
+    stage: crate::residency::VramStage,
+) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    if stage < crate::residency::VramStage::Alert
+        || !fills(desc)
+        || desc.dimension != TEXTURE_2D
+        || desc.depth_or_array_size != 1
+        || desc.sample_count > 1
+        || desc.mip_levels <= 1
+        || desc.width <= 256
+        || desc.height <= 256
+    {
+        return first;
+    }
+    let large = desc.width > 1024 || desc.height > 1024;
+    let drop_levels = match (stage, large) {
+        (crate::residency::VramStage::Alert, true) => 2,
+        (crate::residency::VramStage::Critical, true) => 3,
+        (crate::residency::VramStage::Alert, false) => 1,
+        (crate::residency::VramStage::Critical, false) => 2,
+        (crate::residency::VramStage::Safe, _) => 0,
+    };
+    first.saturating_add(drop_levels).min(u32::from(desc.mip_levels) - 1)
+}
+
 /// The level a host copy begins at for views that start at `first`: one the
 /// host can have as a texture's level 0 ([`read_from`]; block-compressed
 /// formats in whole blocks).
@@ -1354,7 +1388,8 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    let effective_first = selective_mip_drop(&r.desc, first, crate::residency::vram_stage());
+    if host.base == 0 || host.base <= base_level(&r.desc, effective_first) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1579,11 +1614,18 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // pick by index among them.
         let mut base = 0;
         if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+            let stage = crate::residency::vram_stage();
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
             if first != u32::MAX {
-                base = base_level(&r.desc, first);
+                let effective = selective_mip_drop(&r.desc, first, stage);
+                base = base_level(&r.desc, effective);
+            } else if stage >= crate::residency::VramStage::Alert {
+                let effective = selective_mip_drop(&r.desc, 0, stage);
+                if effective > 0 {
+                    base = base_level(&r.desc, effective);
+                }
             }
         }
         let texture = match texture {
@@ -1674,21 +1716,38 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 /// sets a limit on those copies' bytes instead). Past the budget the system moves the card's memory into the PC's,
 /// which ended runs 20 and 24.
 #[cfg(windows)]
-pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
+#[allow(clippy::too_many_arguments)]
+fn room_for(
+    memory: Option<[u64; 4]>,
+    filled: u64,
+    limit: Option<u64>,
+    stage: crate::residency::VramStage,
+    effective_ceiling: Option<u64>,
+    soft_target: Option<u64>,
+    texture_pool_room: u64,
+    card_room: u64,
+    targets_room: u64,
+) -> bool {
     const WITHOUT_BUDGET: u64 = 4 << 30;
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
-    });
-    // (With the tiles of the copies made level by level, whose own bytes
-    // count as none: `crate::tiles`.)
-    let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
     if let Some(limit) = limit {
         return filled < limit;
     }
-    let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
+    // Stage 3 (Critical: >= 85% VRAM, >= DXGI budget, commit < 512 MiB, or OOM
+    // backoff) strictly halts bindless texture growth to preserve Windows DWM.
+    if stage == crate::residency::VramStage::Critical {
+        return false;
+    }
+    if let Some([budget, used, ..]) = memory {
+        let effective = effective_ceiling.unwrap_or(budget);
+        if effective > 0 && used >= effective {
+            return false;
+        }
+        let target = soft_target.unwrap_or(effective);
+        if target > 0 && used >= target {
+            return false;
+        }
+    }
+    let floor = texture_floor_bytes(effective_ceiling);
     if filled < floor {
         return true;
     }
@@ -1698,199 +1757,144 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
+            let effective = effective_ceiling.unwrap_or(budget);
+            let target = soft_target.unwrap_or(effective);
+            used.saturating_sub(texture_pool_room)
+                .saturating_add(card_room)
+                .saturating_add(targets_room)
+                < target
         }
         None => filled < WITHOUT_BUDGET,
     }
 }
 
-/// The bytes of the card's memory the texture queue leaves free for
-/// render targets and other host copies the host itself writes that are
-/// not made yet ([`targets_rule`]).
-///
-/// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
-/// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
-/// on, none of them idle (run 198's census). They are made with no room
-/// test, in the same frame as the card copies of title buffers (762 MB),
-/// after the texture queue has filled the card to its line with textures
-/// written while the world loaded (7.3 GB of them at the first world frame
-/// of run 193, of which 2.3 GB were let go again within 13 seconds). The
-/// card then stood at 99 to 100.5 % of its budget, buffer copies were
-/// turned down for good (31 of 95 made: the frame 355 ms where 95 give
-/// 238), and the queue was refused from the first world frame on. With
-/// their room kept, the queue stops that much earlier while the world
-/// loads and gets it back as the targets are made.
-///
-/// A fixed 3,072 MB was what those runs needed. With the Series S profile
-/// and the upscaler at 720p the targets came to 1,407-1,445 MB at most
-/// (prison runs of 27/11): some 1,650 MB stayed kept for targets that never
-/// came, the queue had no room for new textures in the world's first
-/// minute and again and again later (122 such warnings in prisao-s-base5),
-/// 5-8 GB of host copies were let go and 2-4 GB made again, and slots went
-/// on showing other textures (the prison guard's forearms in a normal
-/// map's blue). With 1,600 MB in all (prisao-s-room16): no warning, every
-/// lost swap made from its new view, the looks for textures to let go
-/// 0.48 ms each instead of 5.50.
+#[cfg(windows)]
+pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
+        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+    });
+    // (With the tiles of the copies made level by level, whose own bytes
+    // count as none: `crate::tiles`.)
+    let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+    let stage = crate::residency::vram_stage();
+    let (effective, target) = match memory {
+        Some([budget, ..]) => {
+            let effective = crate::residency::vram_ceiling_bytes(budget);
+            let target = match room_percent_override() {
+                Some(percent) => effective / 100 * percent,
+                None => crate::residency::vram_soft_target_bytes(budget),
+            };
+            (Some(effective), Some(target))
+        }
+        None => (None, None),
+    };
+    room_for(
+        memory,
+        filled,
+        limit,
+        stage,
+        effective,
+        target,
+        crate::pool::texture_room(),
+        crate::shadow::card_room_kept(),
+        targets_room_kept_at(stage),
+    )
+}
+
+/// Stage-aware dynamic render-target VRAM reserve calculation (universal across
+/// 8 / 10 / 12 / 16 / 24 GB+ GPUs):
+/// - `VramStage::Safe`: keeps the full upfront base (`768 MiB` for `<= 8.5 GiB`,
+///   `1,536 MiB` for `<= 16.5 GiB`, `2,048 MiB` for `> 16.5 GiB`) and `256 MiB`
+///   headroom above allocated `targets`.
+/// - `VramStage::Alert` (75%..85% VRAM): yields idle base reserve (`256 / 512 /
+///   768 MiB`) and tightens margin to `128 MiB` so texture streaming retains
+///   ~384–512 MiB of headroom up to the 85% target without zeroing RT safety.
+/// - `VramStage::Critical` (>= 85% VRAM / DXGI budget / low commit): keeps a
+///   minimal protective floor (`128 / 256 / 384 MiB` base, `64 MiB` margin)
+///   while `room()` strictly denies new bindless texture growth for DWM safety.
+/// - Explicit `VICTORY_CARD_ROOM_FOR_TARGETS_MB` overrides the base in `Safe`
+///   (`0` disables in all stages, `N` sets an explicit MiB base capped at 8,192 MiB),
+///   while in `Alert` and `Critical` it yields down to `min(N, auto_base)` so profiles
+///   like `8gb` (`VICTORY_CARD_ROOM_FOR_TARGETS_MB=768`) still release margin under pressure.
+#[cfg(windows)]
+fn targets_room_kept_for(
+    targets: u64,
+    dedicated_vram: Option<u64>,
+    vram_target: Option<u64>,
+    env_mb: Option<u64>,
+    stage: crate::residency::VramStage,
+) -> u64 {
+    use crate::residency::VramStage;
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    if env_mb == Some(0) {
+        return 0;
+    }
+    let (auto_base, margin) = match stage {
+        VramStage::Safe => {
+            let base = match dedicated_vram {
+                Some(total) if total <= crate::residency::VRAM_8GB_THRESHOLD => 768 * MIB,
+                Some(total) if total <= 16 * GIB + 512 * MIB => 1_536 * MIB,
+                Some(_) => 2_048 * MIB,
+                None => 768 * MIB,
+            };
+            (base, 256 * MIB)
+        }
+        VramStage::Alert => {
+            let base = match dedicated_vram {
+                Some(total) if total <= crate::residency::VRAM_8GB_THRESHOLD => 256 * MIB,
+                Some(total) if total <= 16 * GIB + 512 * MIB => 512 * MIB,
+                Some(_) => 768 * MIB,
+                None => 256 * MIB,
+            };
+            (base, 128 * MIB)
+        }
+        VramStage::Critical => {
+            let base = match dedicated_vram {
+                Some(total) if total <= crate::residency::VRAM_8GB_THRESHOLD => 128 * MIB,
+                Some(total) if total <= 16 * GIB + 512 * MIB => 256 * MIB,
+                Some(_) => 384 * MIB,
+                None => 128 * MIB,
+            };
+            (base, 64 * MIB)
+        }
+    };
+    let base = match (env_mb, stage) {
+        (Some(mb), VramStage::Safe) => mb.min(8192) * MIB,
+        (Some(mb), VramStage::Alert | VramStage::Critical) => (mb.min(8192) * MIB).min(auto_base),
+        (None, _) => auto_base,
+    };
+    let mut desired = base.max(targets.saturating_add(margin));
+    if let Some(cap) = vram_target
+        && cap > 0
+    {
+        desired = desired.min(cap);
+    }
+    desired.saturating_sub(targets)
+}
+
+#[cfg(windows)]
+fn targets_room_kept_at(stage: crate::residency::VramStage) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ENV_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let env_mb = *ENV_MB.get_or_init(|| {
+        std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    // Every host texture's bytes less those of the copies the title fills.
+    let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
+    let dedicated = crate::residency::dedicated_vram_bytes();
+    let vram_target = dedicated.map(crate::residency::vram_target_from_total);
+    targets_room_kept_for(targets, dedicated, vram_target, env_mb, stage)
+}
+
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
-    use std::sync::atomic::Ordering::Relaxed;
-    // Every host texture's bytes less those of the copies the title fills.
-    let now = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    let peak = TARGETS_PEAK.fetch_max(now, Relaxed).max(now);
-    let (most, fixed) = targets_most();
-    targets_rule(most, fixed, now, peak, targets_known(), TARGETS_GROWN.load(Relaxed)).0
-}
-
-/// The most kept for targets in all, and whether it was set by hand:
-/// `VICTORY_CARD_ROOM_FOR_TARGETS_MB=<n>` keeps that many in all (0: none),
-/// as the fixed rule did; without it, 3,072 MB at most ([`targets_rule`]).
-#[cfg(windows)]
-fn targets_most() -> (u64, bool) {
-    static MOST: std::sync::OnceLock<(u64, bool)> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        match std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
-            Some(mb) => (mb.min(8192) << 20, true),
-            None => (3072 << 20, false),
-        }
-    })
-}
-
-/// The most bytes the textures the host writes held at once, since the
-/// start ([`targets_room_kept`]).
-#[cfg(windows)]
-static TARGETS_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Bytes added to the targets' margin each time the card's memory in use
-/// passed the system's budget ([`targets_presented`]).
-#[cfg(windows)]
-static TARGETS_GROWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// The first frame that ran 500 draws or more: the world's (its targets
-/// are made in it and the frames after).
-#[cfg(windows)]
-static WORLD_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-
-/// Frames after the world's first until what its targets take is taken
-/// for known: some ten seconds at the frame rates of a world that loads.
-const TARGETS_SETTLE_FRAMES: u64 = 300;
-
-/// The least margin kept above the targets' peak, and its share of the
-/// peak ([`targets_rule`]).
-const TARGETS_MARGIN_MIN: u64 = 384 << 20;
-const TARGETS_MARGIN_QUARTERS: u64 = 1;
-
-/// What is kept for targets in all once known is grown by this much each
-/// time the card's memory in use passed the budget, up to the most.
-const TARGETS_GROW_STEP: u64 = 256 << 20;
-
-/// Whether what the world's targets take is known: [`TARGETS_SETTLE_FRAMES`]
-/// after its first frame.
-#[cfg(windows)]
-fn targets_known() -> bool {
-    let world = WORLD_AT.load(std::sync::atomic::Ordering::Relaxed);
-    world != u64::MAX && crate::frame::current().saturating_sub(world) >= TARGETS_SETTLE_FRAMES
-}
-
-/// Which rule set the room kept for targets ([`targets_rule`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TargetsBy {
-    /// `VICTORY_CARD_ROOM_FOR_TARGETS_MB`: that many in all.
-    Hand,
-    /// Before the world's targets are known: the most (3,072 MB in all).
-    Unknown,
-    /// Their peak, a margin and what overruns of the budget added.
-    Measured,
-}
-
-/// The room kept for targets not made yet, and the rule that set it, from
-/// the most kept in all (`most`; set by hand: `fixed`), what the textures
-/// the host writes hold now (`now`) and held at most (`peak`), whether the
-/// world's targets are known, and what overruns of the budget added
-/// (`grown`). Kept in all: by hand, `most`; before the world's targets are
-/// known, `most` as before; then their peak, a quarter of it more (at
-/// least 384 MB: a cutscene's or a resolution's larger targets fit there),
-/// and `grown`, never more than `most`. What they hold now is not kept
-/// again.
-pub(crate) fn targets_rule(most: u64, fixed: bool, now: u64, peak: u64, known: bool, grown: u64) -> (u64, TargetsBy) {
-    let peak = peak.max(now);
-    let (all, by) = if fixed {
-        (most, TargetsBy::Hand)
-    } else if !known {
-        (most, TargetsBy::Unknown)
-    } else {
-        let margin = (peak / 4 * TARGETS_MARGIN_QUARTERS).max(TARGETS_MARGIN_MIN);
-        ((peak + margin + grown).min(most), TargetsBy::Measured)
-    };
-    (all.saturating_sub(now), by)
-}
-
-/// At each present (frame `frame`): notes the world's first frame (500
-/// draws or more since the last present), grows the targets' margin when
-/// the card's memory in use passed the system's budget (once a second at
-/// most), and says what the room for textures stands at: once a minute,
-/// and when the room kept for targets moved by 256 MB or more (once every
-/// five seconds at most).
-///
-/// What protects a cutscene or a resolution change whose new targets are
-/// larger than any before, once the textures have the room: the margin
-/// above the peak; the system's own count of the card's memory in use,
-/// which [`room`] reads, so that no new texture is made from the moment
-/// the targets take it; the sweep that lets idle textures go when that
-/// count passes its line (`crate::host::vram_keep`); and the margin grown
-/// by [`TARGETS_GROW_STEP`] each time the count passes the budget, which
-/// stays for the run.
-#[cfg(windows)]
-pub(crate) fn targets_presented(frame: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    static LAST_DRAWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let drawn = crate::draw::drawn();
-    let before = LAST_DRAWN.swap(drawn, Relaxed);
-    if drawn.saturating_sub(before) >= 500 && WORLD_AT.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok() {
-        tracing::info!(frame, "the world's first frame (500 draws or more): what its targets take is measured from here on");
-    }
-    // Once a second.
-    static SECOND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let now_ms = crate::host::now_ms();
-    let second = now_ms / 1000 + 1;
-    if SECOND.swap(second, Relaxed) == second {
-        return;
-    }
-    let Some([budget, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) else {
-        return;
-    };
-    let (most, fixed) = targets_most();
-    if used > budget && !fixed && targets_known() {
-        let grown = TARGETS_GROWN.load(Relaxed);
-        if grown < most {
-            TARGETS_GROWN.store((grown + TARGETS_GROW_STEP).min(most), Relaxed);
-        }
-    }
-    static SAID: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-    let kept = targets_room_kept();
-    let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    let (_, by) = targets_rule(most, fixed, targets, TARGETS_PEAK.load(Relaxed), targets_known(), TARGETS_GROWN.load(Relaxed));
-    let last_ms = SAID[0].load(Relaxed);
-    let moved = SAID[1].load(Relaxed).abs_diff(kept) >= 256 << 20;
-    if last_ms != 0 && now_ms.saturating_sub(last_ms) < 60_000 && !(moved && now_ms.saturating_sub(last_ms) >= 5000) {
-        return;
-    }
-    SAID[0].store(now_ms.max(1), Relaxed);
-    SAID[1].store(kept, Relaxed);
-    let mb = |b: u64| b >> 20;
-    tracing::info!(
-        "the card's memory for textures: {} MB in use of a budget of {} MB (the system's count); kept for render targets not made yet {} MB ({:?}: targets hold {} MB now, {} MB at most; {} MB added after the budget was passed; VICTORY_CARD_ROOM_FOR_TARGETS_MB), {} MB for card copies of buffers, {} MB of texture blocks free; room for new textures: {}",
-        mb(used),
-        mb(budget),
-        mb(kept),
-        by,
-        mb(targets),
-        mb(TARGETS_PEAK.load(Relaxed)),
-        mb(TARGETS_GROWN.load(Relaxed)),
-        mb(crate::shadow::card_room_kept()),
-        mb(crate::pool::texture_room()),
-        if room(Some([budget, used, 0, 0])) { "yes" } else { "no" }
-    );
+    targets_room_kept_at(crate::residency::vram_stage())
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -1919,13 +1923,13 @@ pub(crate) fn room_lately() -> bool {
 /// 1 MiB up take 449 MB more of the card than before (941 against 492),
 /// and 94 gives the textures about that much back.
 #[cfg(windows)]
-fn room_percent() -> u64 {
-    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *PERCENT.get_or_init(|| {
+fn room_percent_override() -> Option<u64> {
+    static OVERRIDE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+            .map(|percent| percent.clamp(50, 97))
     })
 }
 
@@ -2170,6 +2174,30 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// Called before a submission starts, by the thread that submits.
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
+/// Computes `(idle_ms, max_bytes_to_shed)` for idle texture eviction by VRAM stage:
+/// - Stage 1 (`Safe`): normal retention via `vram_keep`.
+/// - Stage 2 (`Alert`, >= 75%): proactive purge with `2,500 ms` timeout and at least
+///   `128 MiB` shed (`eff_used.saturating_sub(alert).max(128 << 20)`) to pull VRAM
+///   back below the Alert threshold before reaching Stage 3.
+/// - Stage 3 (`Critical`, >= 85%): hard purge with `1,500 ms` timeout and at least
+///   `256 MiB` shed (`eff_used.saturating_sub(target).max(256 << 20)`).
+#[cfg(windows)]
+fn idle_purge_for_stage(stage: crate::residency::VramStage, budget: u64, eff_used: u64) -> (u64, u64) {
+    match stage {
+        crate::residency::VramStage::Critical => {
+            let target = crate::residency::vram_soft_target_bytes(budget);
+            let shed = eff_used.saturating_sub(target).max(256 << 20);
+            (1_500, shed)
+        }
+        crate::residency::VramStage::Alert => {
+            let alert = crate::residency::vram_alert_target_bytes(budget);
+            let shed = eff_used.saturating_sub(alert).max(128 << 20);
+            (2_500, shed)
+        }
+        crate::residency::VramStage::Safe => crate::host::vram_keep(budget, eff_used),
+    }
+}
+
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
@@ -2192,12 +2220,13 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
+    let stage = crate::residency::vram_stage();
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
+            let eff_used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
-            crate::host::vram_keep(budget, used)
+            idle_purge_for_stage(stage, budget, eff_used)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
@@ -2536,6 +2565,14 @@ pub(crate) fn host_resource<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+/// Whether `this` is a valid title resource created by this runtime.
+#[cfg(windows)]
+pub(crate) fn is_resource(this: This) -> bool {
+    let mut table = [0; size_of::<usize>()];
+    crate::host::read_into(this.cast(), &mut table)
+        && usize::from_ne_bytes(table) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
@@ -2682,6 +2719,7 @@ fn host_texture_as(
         }
     };
     if let Err(e) = &made {
+        crate::residency::allocation_error(&e);
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
     if !reserved
@@ -3100,8 +3138,8 @@ static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>
 #[cfg(windows)]
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// See [`PLACED_TWINS`] (for the memory line of `copystat`).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// See [`PLACED_TWINS`].
+#[cfg(windows)]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -3153,9 +3191,8 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
 
 /// The resource [`texture_at`] made for a texture placed at `address` with
 /// the description `desc`, if it has made one: never made here (for the
-/// frame listing, which must not count as a use, and for a slot swept
-/// from a lost swap: `crate::descriptor::host`).
-#[cfg(windows)]
+/// frame listing, which must not count as a use).
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut key = *desc;
     key[1] = 0;
@@ -3450,34 +3487,6 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
-
-    #[test]
-    fn the_room_for_targets_follows_what_they_take_once_known() {
-        const MB: u64 = 1 << 20;
-        let most = 3072 * MB;
-        // Before the world's targets are known: the most in all, less what
-        // they hold now (as the fixed rule).
-        assert_eq!(targets_rule(most, false, 652 * MB, 652 * MB, false, 0), (2420 * MB, TargetsBy::Unknown));
-        // Known: the peak and a quarter more (the prison: 1,445 MB at most,
-        // 1,400 now), 361 MB less than the least margin, which holds.
-        assert_eq!(
-            targets_rule(most, false, 1400 * MB, 1445 * MB, true, 0),
-            ((1445 + 384 - 1400) * MB, TargetsBy::Measured)
-        );
-        // A larger peak: a quarter of it.
-        assert_eq!(targets_rule(most, false, 2000 * MB, 2400 * MB, true, 0), ((2400 + 600 - 2000) * MB, TargetsBy::Measured));
-        // Never more than the most, grown or not.
-        assert_eq!(targets_rule(most, false, 2000 * MB, 2800 * MB, true, 512 * MB).0, (3072 - 2000) * MB);
-        // Targets let go (a cutscene's): their room comes back.
-        assert_eq!(targets_rule(most, false, 900 * MB, 1445 * MB, true, 0).0, (1445 + 384 - 900) * MB);
-        // Targets larger than any before: the peak is what they hold now.
-        assert_eq!(targets_rule(most, false, 2500 * MB, 1445 * MB, true, 0).0, (3072 - 2500) * MB);
-        // Overruns of the budget grow it.
-        assert_eq!(targets_rule(most, false, 1400 * MB, 1445 * MB, true, 256 * MB).0, (1445 + 384 + 256 - 1400) * MB);
-        // By hand: that many in all, known or not; 0 keeps none.
-        assert_eq!(targets_rule(1600 * MB, true, 1400 * MB, 1445 * MB, true, 256 * MB), (200 * MB, TargetsBy::Hand));
-        assert_eq!(targets_rule(0, true, 1400 * MB, 1445 * MB, false, 0).0, 0);
-    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
@@ -3971,98 +3980,6 @@ mod tests {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
         }
-    }
-
-    /// An earlier title-memory upload must not suppress a later alias copy
-    /// from a GPU-written probe atlas into the same sampled texture.
-    #[cfg(all(windows, feature = "diagnostics"))]
-    #[test]
-    fn alias_after_title_upload_copies_the_gpu_atlas() {
-        use std::sync::atomic::Ordering::Relaxed;
-        use windows::Win32::Graphics::Direct3D12::*;
-
-        let Some(host) = crate::host::host() else {
-            return;
-        };
-        let null = std::ptr::null();
-        let mut source = null;
-        let mut view = null;
-        let source_desc = ResourceDesc {
-            flags: 4,
-            ..texture(4, 4, 42, 1)
-        };
-        assert_eq!(
-            create_committed(
-                null, &PROPERTIES, 0, &source_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut source,
-            ),
-            S_OK
-        );
-        assert_eq!(
-            create_at_address(
-                null, resource(source).data() as u64, &texture(4, 4, 67, 1), 0,
-                null.cast(), &RESOURCE_IIDS[0], &mut view,
-            ),
-            S_OK
-        );
-        resource(view).host.placed.store(true, Relaxed);
-        assert_eq!(alias_of(view), Some(source));
-        let written = host_resource(source).unwrap();
-        let sampled = host_resource(view).unwrap();
-        let (upload, data) = host.upload_buffer(1024).unwrap();
-        let seed = host.new_list().unwrap();
-        let packed_light = 0x8c02_0100_u32;
-        // SAFETY: four rows of four texels in the upload's 1024 mapped bytes.
-        unsafe {
-            for row in 0..4 {
-                for x in 0..4 {
-                    data.add(row * 256 + x * 4).cast::<u32>().write_unaligned(packed_light);
-                }
-            }
-            let dst = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(written),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-            };
-            let src = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&upload),
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                        Offset: 0,
-                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: written.GetDesc().Format,
-                            Width: 4,
-                            Height: 4,
-                            Depth: 1,
-                            RowPitch: 256,
-                        },
-                    },
-                },
-            };
-            crate::list::ensure_state(&seed, source, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
-            seed.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-        }
-        seed.close();
-        host.execute(&[&seed]);
-
-        let list = host.new_list().unwrap();
-        crate::texture::upload(&list, view, sampled);
-        assert!(crate::texture::alias(&list, view, source));
-        crate::list::ensure_state(&list, view, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
-        let (readback, rows) = crate::capture::read_back(&host.device, &list.list, sampled).unwrap();
-        list.close();
-        host.execute(&[&list]);
-        let mut mapped = std::ptr::null_mut();
-        // SAFETY: the completed copy contains at least one 32-bit texel.
-        let actual = unsafe {
-            readback.Map(0, None, Some(&mut mapped)).unwrap();
-            let texel = mapped.cast::<u8>().add(rows.Offset as usize).cast::<u32>().read_unaligned();
-            readback.Unmap(0, None);
-            texel
-        };
-        resource_release(view);
-        resource_release(source);
-        assert_eq!(actual, packed_light, "the sampled texture kept the CPU upload instead of the GPU atlas");
     }
 
     /// A 16-bit depth texture the title also asks unordered access for gets
@@ -4812,6 +4729,176 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+        #[cfg(windows)]
+        {
+            const MIB: u64 = 1 << 20;
+            // Dynamic ceiling rejects new bindless texture growth immediately on 8 GB and larger GPUs.
+            assert!(!room(Some([8 * GIB, 8 * GIB, 0, 0])));
+            assert!(!room(Some([16 * GIB, 16 * GIB, 0, 0])));
+            // Dynamic 85% target scales across all GPU tiers when no env override is set.
+            assert_eq!(crate::residency::vram_soft_target_for(11_500 * MIB, Some(12 * GIB), None) >> 20, 10_444);
+            assert_eq!(crate::residency::vram_soft_target_for(23_500 * MIB, Some(24 * GIB), None) >> 20, 20_889);
+
+            use crate::residency::VramStage;
+            // Dynamic targets_room_kept in Safe: 8 GB starts at 768 MiB, tracks targets + 256 MiB up to 85% cap.
+            let target_8g = Some(crate::residency::vram_target_from_total(8 * GIB));
+            assert_eq!(targets_room_kept_for(0, Some(8 * GIB), target_8g, None, VramStage::Safe), 768 * MIB);
+            assert_eq!(targets_room_kept_for(300 * MIB, Some(8 * GIB), target_8g, None, VramStage::Safe), 468 * MIB);
+            assert_eq!(targets_room_kept_for(600 * MIB, Some(8 * GIB), target_8g, None, VramStage::Safe), 256 * MIB);
+            assert_eq!(targets_room_kept_for(2_000 * MIB, Some(8 * GIB), target_8g, None, VramStage::Safe), 256 * MIB);
+            assert_eq!(targets_room_kept_for(6_900 * MIB, Some(8 * GIB), target_8g, None, VramStage::Safe) >> 20, 63);
+            // Larger GPUs start at 1,536 MiB (12-16 GB) and 2,048 MiB (24 GB+).
+            assert_eq!(targets_room_kept_for(0, Some(12 * GIB), Some(10_444 * MIB), None, VramStage::Safe), 1_536 * MIB);
+            assert_eq!(targets_room_kept_for(0, Some(24 * GIB), Some(20_889 * MIB), None, VramStage::Safe), 2_048 * MIB);
+            // Explicit override works (`0` disables all stages; `N` sets base in Safe and yields to `min(N, auto_base)` in Alert/Critical).
+            assert_eq!(targets_room_kept_for(0, Some(8 * GIB), target_8g, Some(0), VramStage::Safe), 0);
+            assert_eq!(targets_room_kept_for(0, Some(8 * GIB), target_8g, Some(0), VramStage::Alert), 0);
+            assert_eq!(targets_room_kept_for(0, Some(8 * GIB), target_8g, Some(0), VramStage::Critical), 0);
+            assert_eq!(targets_room_kept_for(0, Some(8 * GIB), target_8g, Some(768), VramStage::Safe), 768 * MIB);
+            assert_eq!(targets_room_kept_for(0, Some(8 * GIB), target_8g, Some(768), VramStage::Alert), 256 * MIB);
+            assert_eq!(targets_room_kept_for(0, Some(8 * GIB), target_8g, Some(768), VramStage::Critical), 128 * MIB);
+            assert_eq!(targets_room_kept_for(0, Some(12 * GIB), Some(10_444 * MIB), Some(512), VramStage::Alert), 512 * MIB);
+            assert_eq!(targets_room_kept_for(0, Some(12 * GIB), Some(10_444 * MIB), Some(384), VramStage::Critical), 256 * MIB);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn targets_room_kept_and_room_yield_in_alert_and_block_in_critical() {
+        use crate::residency::{VramStage, vram_ceiling_for, vram_soft_target_for, vram_target_from_total};
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+
+        // Exact RTX 5050 8 GB telemetry from cool_fox-8gb-26.log:
+        // dedicated = 7,911 MiB, DXGI budget = 7,143 MiB, 85% target = 6,724 MiB.
+        let dedicated_8g = 7_911 * MIB;
+        let budget_8g = 7_143 * MIB;
+        let ceiling_8g = vram_ceiling_for(budget_8g, Some(dedicated_8g), None);
+        let target_8g = vram_soft_target_for(budget_8g, Some(dedicated_8g), None);
+        assert_eq!(target_8g >> 20, 6_724);
+
+        // Stage-aware reserve shrinks monotonically Safe -> Alert -> Critical while staying > 0.
+        let safe_0 = targets_room_kept_for(0, Some(dedicated_8g), Some(target_8g), None, VramStage::Safe);
+        let alert_0 = targets_room_kept_for(0, Some(dedicated_8g), Some(target_8g), None, VramStage::Alert);
+        let crit_0 = targets_room_kept_for(0, Some(dedicated_8g), Some(target_8g), None, VramStage::Critical);
+        assert_eq!(safe_0, 768 * MIB);
+        assert_eq!(alert_0, 256 * MIB);
+        assert_eq!(crit_0, 128 * MIB);
+        assert!(crit_0 > 0 && crit_0 < alert_0 && alert_0 < safe_0);
+
+        // With allocated render targets, Alert keeps 128 MiB margin (< Safe 256 MiB, > 0).
+        let safe_500 = targets_room_kept_for(500 * MIB, Some(dedicated_8g), Some(target_8g), None, VramStage::Safe);
+        let alert_500 = targets_room_kept_for(500 * MIB, Some(dedicated_8g), Some(target_8g), None, VramStage::Alert);
+        let crit_500 = targets_room_kept_for(500 * MIB, Some(dedicated_8g), Some(target_8g), None, VramStage::Critical);
+        assert_eq!(safe_500, 268 * MIB);
+        assert_eq!(alert_500, 128 * MIB);
+        assert_eq!(crit_500, 64 * MIB);
+
+        // Larger GPU tiers (12-16 GB and 24 GB+) scale proportionally without hardcoded caps.
+        assert_eq!(targets_room_kept_for(0, Some(12 * GIB), Some(vram_target_from_total(12 * GIB)), None, VramStage::Alert), 512 * MIB);
+        assert_eq!(targets_room_kept_for(0, Some(24 * GIB), Some(vram_target_from_total(24 * GIB)), None, VramStage::Alert), 768 * MIB);
+        assert_eq!(targets_room_kept_for(0, Some(12 * GIB), Some(vram_target_from_total(12 * GIB)), None, VramStage::Critical), 256 * MIB);
+        assert_eq!(targets_room_kept_for(0, Some(24 * GIB), Some(vram_target_from_total(24 * GIB)), None, VramStage::Critical), 384 * MIB);
+
+        // At 6,027 MiB used (Alert, ~697 MiB below 6,724 MiB 85% target) with 200 MiB card_room:
+        // Safe's 768 MiB reserve caused premature deadlock; Alert's 256 MiB reserve keeps room == true.
+        let used_alert = 6_027 * MIB;
+        let filled = 3_000 * MIB;
+        let card_room = 200 * MIB;
+        assert!(!room_for(
+            Some([budget_8g, used_alert, 0, 0]),
+            filled,
+            None,
+            VramStage::Safe,
+            Some(ceiling_8g),
+            Some(target_8g),
+            0,
+            card_room,
+            safe_0,
+        ));
+        assert!(room_for(
+            Some([budget_8g, used_alert, 0, 0]),
+            filled,
+            None,
+            VramStage::Alert,
+            Some(ceiling_8g),
+            Some(target_8g),
+            0,
+            card_room,
+            alert_0,
+        ));
+
+        // In Critical (used >= 85%, used >= DXGI budget, or low commit), room is strictly false for DWM safety.
+        assert!(!room_for(
+            Some([budget_8g, target_8g, 0, 0]),
+            filled,
+            None,
+            VramStage::Critical,
+            Some(ceiling_8g),
+            Some(target_8g),
+            512 * MIB,
+            0,
+            crit_0,
+        ));
+        assert!(!room_for(
+            Some([budget_8g, budget_8g, 0, 0]),
+            512 * MIB,
+            None,
+            VramStage::Critical,
+            Some(ceiling_8g),
+            Some(target_8g),
+            0,
+            0,
+            crit_0,
+        ));
+        // Even if stage is lagging behind a sudden spike to >= 85% target, room_for still denies growth.
+        assert!(!room_for(
+            Some([budget_8g, target_8g, 0, 0]),
+            512 * MIB,
+            None,
+            VramStage::Alert,
+            Some(ceiling_8g),
+            Some(target_8g),
+            512 * MIB,
+            0,
+            alert_0,
+        ));
+        // Critical from low Windows commit (< 512 MiB) denies growth even when VRAM used is low.
+        assert!(!room_for(
+            Some([budget_8g, 4_000 * MIB, 0, 0]),
+            512 * MIB,
+            None,
+            VramStage::Critical,
+            Some(ceiling_8g),
+            Some(target_8g),
+            0,
+            0,
+            crit_0,
+        ));
+
+        // Explicit VICTORY_CARD_ROOM_FOR_TARGETS_MB=768 (used by 8gb launch profile):
+        // preserves 768 MiB in Safe, yields to 256 MiB in Alert and 128 MiB in Critical.
+        assert_eq!(targets_room_kept_for(0, Some(dedicated_8g), Some(target_8g), Some(768), VramStage::Safe), 768 * MIB);
+        let env_alert = targets_room_kept_for(0, Some(dedicated_8g), Some(target_8g), Some(768), VramStage::Alert);
+        assert_eq!(env_alert, 256 * MIB);
+        assert_eq!(targets_room_kept_for(0, Some(dedicated_8g), Some(target_8g), Some(768), VramStage::Critical), 128 * MIB);
+        // Smaller explicit override is never inflated by auto_base; Some(0) still disables all stages.
+        assert_eq!(targets_room_kept_for(0, Some(dedicated_8g), Some(target_8g), Some(128), VramStage::Alert), 128 * MIB);
+        assert_eq!(targets_room_kept_for(0, Some(dedicated_8g), Some(target_8g), Some(0), VramStage::Safe), 0);
+        assert_eq!(targets_room_kept_for(0, Some(dedicated_8g), Some(target_8g), Some(0), VramStage::Alert), 0);
+        assert_eq!(targets_room_kept_for(0, Some(dedicated_8g), Some(target_8g), Some(0), VramStage::Critical), 0);
+        // With VICTORY_CARD_ROOM_FOR_TARGETS_MB=768 at 6,027 MiB in Alert, room_for stays true.
+        assert!(room_for(
+            Some([budget_8g, used_alert, 0, 0]),
+            filled,
+            None,
+            VramStage::Alert,
+            Some(ceiling_8g),
+            Some(target_8g),
+            0,
+            card_room,
+            env_alert,
+        ));
     }
 
     /// A placed texture viewed from a later level has a host copy of that
@@ -4845,5 +4932,70 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn selective_mip_drop_triggers_only_in_alert_or_critical_and_shields_ui_and_small_textures() {
+        use crate::residency::VramStage;
+        let make_desc = |w: u64, h: u32, mips: u16, flags: u32| ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: w,
+            height: h,
+            depth_or_array_size: 1,
+            mip_levels: mips,
+            format: 98, // BC7
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0x105,
+            flags,
+        };
+        let large_4k = make_desc(4096, 4096, 13, 0);
+        let large_2k = make_desc(2048, 1024, 12, 0);
+        let medium_1k = make_desc(1024, 1024, 11, 0);
+        let medium_512 = make_desc(512, 512, 10, 0);
+        let small = make_desc(256, 256, 9, 0);
+        let banner = make_desc(1024, 256, 11, 0);
+        let ui_single_mip = make_desc(2048, 2048, 1, 0);
+        let render_target = make_desc(2048, 2048, 12, 1);
+
+        // Stage 1 (Safe): never drops mips regardless of size.
+        assert_eq!(selective_mip_drop(&large_4k, 0, VramStage::Safe), 0);
+        assert_eq!(selective_mip_drop(&medium_1k, 2, VramStage::Safe), 2);
+
+        // Large scenery (> 1024 px, 2K/4K): +2 in Alert, +3 in Critical.
+        assert_eq!(selective_mip_drop(&large_4k, 0, VramStage::Alert), 2);
+        assert_eq!(selective_mip_drop(&large_4k, 0, VramStage::Critical), 3);
+        assert_eq!(selective_mip_drop(&large_2k, 1, VramStage::Alert), 3);
+        assert_eq!(selective_mip_drop(&large_2k, 1, VramStage::Critical), 4);
+        assert_eq!(selective_mip_drop(&large_4k, 11, VramStage::Critical), 12);
+
+        // Medium scenery (> 256 px ..= 1024 px): +1 in Alert, +2 in Critical.
+        assert_eq!(selective_mip_drop(&medium_1k, 0, VramStage::Alert), 1);
+        assert_eq!(selective_mip_drop(&medium_1k, 0, VramStage::Critical), 2);
+        assert_eq!(selective_mip_drop(&medium_512, 2, VramStage::Alert), 3);
+        assert_eq!(selective_mip_drop(&medium_512, 2, VramStage::Critical), 4);
+        assert_eq!(selective_mip_drop(&medium_1k, 10, VramStage::Alert), 10);
+
+        // Shielded: <= 256 px, UI single-mip, and render targets stay at 0 drop.
+        assert_eq!(selective_mip_drop(&small, 0, VramStage::Alert), 0);
+        assert_eq!(selective_mip_drop(&small, 0, VramStage::Critical), 0);
+        assert_eq!(selective_mip_drop(&banner, 0, VramStage::Critical), 0);
+        assert_eq!(selective_mip_drop(&ui_single_mip, 0, VramStage::Critical), 0);
+        assert_eq!(selective_mip_drop(&render_target, 0, VramStage::Critical), 0);
+
+        // Proactive Stage 2 (Alert) and Stage 3 (Critical) idle purge policy.
+        let mib = 1u64 << 20;
+        let budget = 8 * 1024 * mib;
+        let (alert_ms, alert_shed_min) = idle_purge_for_stage(VramStage::Alert, budget, 6_000 * mib);
+        assert_eq!(alert_ms, 2_500);
+        assert!(alert_shed_min >= 128 * mib);
+        let (alert_ms2, alert_shed_excess) = idle_purge_for_stage(VramStage::Alert, budget, 6_600 * mib);
+        assert_eq!(alert_ms2, 2_500);
+        assert!(alert_shed_excess > 128 * mib);
+        let (crit_ms, crit_shed) = idle_purge_for_stage(VramStage::Critical, budget, 7_300 * mib);
+        assert_eq!(crit_ms, 1_500);
+        assert!(crit_shed >= 256 * mib);
     }
 }

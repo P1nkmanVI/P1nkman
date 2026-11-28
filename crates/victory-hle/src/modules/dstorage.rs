@@ -227,11 +227,20 @@ extern "system" fn create_queue(
     )
 }
 
-/// The title asks for 32 MiB and stops if this fails.
+/// The title asks for 32 MiB and stops if this fails. Give PC worker threads
+/// enough staging headroom (default 256 MiB) so multi-MB RPF chunks don't
+/// starve the remaining cores.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
-    tracing::info!(size, "dstorage: staging buffer size");
+    static FLOOR_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let floor = *FLOOR_MB.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_STAGING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(256)
+    }) << 20;
+    tracing::info!(size, floor, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = u64::from(size).max(floor);
     }
     S_OK
 }
@@ -430,7 +439,7 @@ fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Re
     /// Read at a time.
     const MOST: usize = 1 << 20;
     let sector = SECTOR as u64;
-    if offset.is_multiple_of(sector) && out.len().is_multiple_of(SECTOR) && (out.as_ptr() as usize).is_multiple_of(SECTOR) {
+    if offset % sector == 0 && out.len() % SECTOR == 0 && out.as_ptr() as usize % SECTOR == 0 {
         return read_overlapped(file, out, offset);
     }
     thread_local! {
@@ -620,7 +629,12 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let cores = std::thread::available_parallelism().map_or(6, |n| n.get());
+        let workers = std::env::var("VICTORY_DSTORAGE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .map_or_else(|| default_dstorage_workers(cores), |n| n.clamp(1, 16));
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -629,7 +643,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(workers = started, cores, "dstorage: workers (VICTORY_DSTORAGE_WORKERS overrides)");
     });
     Some(scheduler)
 }
@@ -763,8 +777,16 @@ pub(crate) mod stream_log {
     }
 }
 
+/// Default DirectStorage worker count scaled to avoid saturating all cores on
+/// 6-core PCs (3 workers on 6C/6T instead of 6).
+fn default_dstorage_workers(cores: usize) -> usize {
+    (cores / 2).clamp(2, 6)
+}
+
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    #[cfg(windows)]
+    victory_gpu::cores::keep_background_thread("dstorage");
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -1578,44 +1600,6 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     result
 }
 
-/// Makes the committed pages of `[at, at + len)` that cannot be written
-/// read-write; returns each such region with its old protection.
-fn open_read_only(at: usize, len: usize) -> Vec<(usize, usize, u32)> {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
-        PAGE_READWRITE, PAGE_WRITECOPY, VirtualProtect, VirtualQuery,
-    };
-    let (mut p, end, mut opened) = (at, at + len, Vec::new());
-    while p < end {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        if unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) } == 0 {
-            break;
-        }
-        let region_end = (info.BaseAddress as usize + info.RegionSize).min(end);
-        let writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-        if info.State == MEM_COMMIT && (info.Protect & writable == 0 || info.Protect & PAGE_GUARD != 0) {
-            let mut old = 0;
-            // SAFETY: committed title memory the request names; only its protection changes.
-            if unsafe { VirtualProtect(p as *const _, region_end - p, PAGE_READWRITE, &mut old) } != 0 {
-                opened.push((p, region_end - p, old));
-            }
-        }
-        p = region_end;
-    }
-    opened
-}
-
-/// Gives the regions [`open_read_only`] opened their protection back.
-fn close_again(regions: &[(usize, usize, u32)]) {
-    for &(at, len, old) in regions {
-        let mut was = 0;
-        // SAFETY: regions we opened just before.
-        unsafe { windows_sys::Win32::System::Memory::VirtualProtect(at as *const _, len, old, &mut was) };
-    }
-}
-
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
@@ -1634,12 +1618,7 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        // The console's engine writes past the processor's page protection;
-        // pages the title made read-only (no guard of ours) are opened for
-        // the write and closed again (a fault here, run of 25/11).
-        let closed = open_read_only(request.destination as usize, len);
         let filled = fill(out).map(drop);
-        close_again(&closed);
         drop(writing);
         // Again now that the bytes are there: a texture looked at in between
         // was uploaded without them (`xmem::pages_written`).
@@ -1974,40 +1953,6 @@ mod tests {
         void(queue, 0x40);
     }
 
-    fn writable_now(at: usize) -> bool {
-        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery};
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-        info.Protect == PAGE_READWRITE
-    }
-
-    /// Read-only memory no guard of ours holds is written all the same,
-    /// like the console's engine does, and stays read-only afterwards.
-    #[test]
-    fn reads_into_read_only_memory_land_and_keep_its_protection() {
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, VirtualAlloc, VirtualFree,
-        };
-        let plain = pattern(6576);
-        let (_dir, file) = file_with(&plain);
-        // SAFETY: a fresh read-only allocation, freed at the end.
-        let at = unsafe { VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY) };
-        assert!(!at.is_null());
-        let (queue, array) = (new_queue(0), status_array(1));
-        enqueue(queue, &request(0, at, plain.len(), file, 0, plain.len()));
-        enqueue_status(queue, array, 0);
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        // SAFETY: our readable allocation.
-        assert_eq!(unsafe { std::slice::from_raw_parts(at.cast::<u8>(), plain.len()) }, &plain[..]);
-        assert!(!writable_now(at as usize), "the title's protection is given back");
-        void(queue, 0x40);
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(at, 0, MEM_RELEASE) };
-    }
-
     #[test]
     fn memory_sources_inflate_too() {
         let plain = pattern(70_000);
@@ -2214,7 +2159,7 @@ mod tests {
         for round in 0..2 {
             for mode in [Io::One, Io::Handles, Io::Overlapped, Io::Direct] {
                 let file = Files::open_for_test(&path, mode);
-                let at: Vec<u64> = (0..READS).map(|_| (random() % (len - SIZE as u64)) & !15).collect();
+                let at: Vec<u64> = (0..READS).map(|_| random() % (len - SIZE as u64) & !15).collect();
                 for pass in ["cold", "again"] {
                     let next = std::sync::atomic::AtomicUsize::new(0);
                     let busy = AtomicU64::new(0);
@@ -2619,5 +2564,14 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn default_dstorage_workers_scales_for_six_core_hosts() {
+        assert_eq!(default_dstorage_workers(4), 2);
+        assert_eq!(default_dstorage_workers(6), 3);
+        assert_eq!(default_dstorage_workers(8), 4);
+        assert_eq!(default_dstorage_workers(12), 6);
+        assert_eq!(default_dstorage_workers(16), 6);
     }
 }

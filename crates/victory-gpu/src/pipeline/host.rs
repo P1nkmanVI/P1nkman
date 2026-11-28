@@ -35,101 +35,6 @@ pub(crate) struct GraphicsState {
     pub(super) samples: DXGI_SAMPLE_DESC,
 }
 
-/// The vertex programs of the title's deferred light volumes: instanced
-/// closed proxies (spot 144 indices, point/capsule/quad 216) drawn additively
-/// into the lighting target with only their front faces (cull back) and the
-/// depth test "greater or equal" (the depth is reversed). The vertex program
-/// does not move a proxy that holds the camera, so such a lamp lights
-/// nothing; the title's separate conservative proxies
-/// (`vs_*_light_proxy_conservative`, cull front, no target) only mark screen
-/// tiles. Hashes in the prison build: VSSpotLight 5d3a25d932263bb7,
-/// VSPointLight 531722868851e35a, VSCapsuleLight ea44aeafa5b7e1aa,
-/// VSQuadLight 39936c25c221af47 (the volumetric `VSSpotLight_13aa26a1` is
-/// not one of them).
-const LIGHT_VOLUMES: [&[u8]; 4] = [
-    b"VSSpotLight_cc280b19",
-    b"VSPointLight_cc280b19",
-    b"VSCapsuleLight_cc280b19",
-    b"VSQuadLight_cc280b19",
-];
-
-/// `VICTORY_LIGHT_VOLUMES`, an experiment on the light volumes
-/// ([`LIGHT_VOLUMES`]); unset (the default) leaves the title's state:
-/// - `inside`: their back faces with the depth test "less or equal" (cull
-///   front), the usual way to draw a volume that may hold the camera: every
-///   surface in front of a proxy's far side is shaded, the lamp's own falloff
-///   bounds it.
-/// - `none`: no culling and no depth test (each covered pixel shaded once
-///   per face: brighter than the title, but nothing a proxy covers is left
-///   out).
-/// - `off`: they write nothing (colour mask 0), to see what they light.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum LightVolumes {
-    Inside,
-    Both,
-    Off,
-}
-
-fn light_volumes() -> Option<LightVolumes> {
-    static SET: std::sync::OnceLock<Option<LightVolumes>> = std::sync::OnceLock::new();
-    *SET.get_or_init(|| match std::env::var("VICTORY_LIGHT_VOLUMES").unwrap_or_default().trim() {
-        "inside" => Some(LightVolumes::Inside),
-        "none" => Some(LightVolumes::Both),
-        "off" => Some(LightVolumes::Off),
-        _ => None,
-    })
-}
-
-/// Changes the state of a light volume's pipeline as `VICTORY_LIGHT_VOLUMES`
-/// asks, before the pipeline is made (and named in the library).
-pub(crate) fn adjust_light_volume(shaders: &[Arc<Shader>], g: &mut GraphicsState) {
-    let Some(set) = light_volumes() else { return };
-    let is_volume = shaders.iter().any(|s| {
-        s.stage == "vertex"
-            && LIGHT_VOLUMES
-                .iter()
-                .any(|name| s.container.windows(name.len()).any(|w| w == *name))
-    });
-    if !is_volume {
-        return;
-    }
-    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-        tracing::info!(
-            ?shaders,
-            ?set,
-            cull = g.rasterizer.CullMode.0,
-            depth_func = g.depth.DepthFunc.0,
-            depth_clip = g.rasterizer.DepthClipEnable.as_bool(),
-            conservative = g.rasterizer.ConservativeRaster.0,
-            "a light volume's state changed (VICTORY_LIGHT_VOLUMES)"
-        );
-    }
-    match set {
-        LightVolumes::Inside => {
-            g.rasterizer.CullMode = D3D12_CULL_MODE_FRONT;
-            // The title's test turned around: "greater" (nearer, reversed
-            // depth) becomes "less", and the other way.
-            g.depth.DepthFunc = match g.depth.DepthFunc {
-                D3D12_COMPARISON_FUNC_GREATER_EQUAL => D3D12_COMPARISON_FUNC_LESS_EQUAL,
-                D3D12_COMPARISON_FUNC_GREATER => D3D12_COMPARISON_FUNC_LESS,
-                D3D12_COMPARISON_FUNC_LESS_EQUAL => D3D12_COMPARISON_FUNC_GREATER_EQUAL,
-                D3D12_COMPARISON_FUNC_LESS => D3D12_COMPARISON_FUNC_GREATER,
-                other => other,
-            };
-        }
-        LightVolumes::Both => {
-            g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
-            g.depth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-        }
-        LightVolumes::Off => {
-            for target in &mut g.blend.RenderTarget {
-                target.RenderTargetWriteMask = 0;
-            }
-        }
-    }
-}
-
 impl Default for GraphicsState {
     fn default() -> Self {
         let target = D3D12_RENDER_TARGET_BLEND_DESC {
@@ -619,6 +524,7 @@ impl HostPipeline {
                         slot == victory_shader::emit::SLOT_FAULTS
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
+                            || slot == victory_shader::emit::SLOT_TABLE_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
                     };
                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
@@ -720,8 +626,7 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    let lanes = stages.first().and_then(|(s, _)| s.translated()).and_then(|t| wave_lanes(&t.host.dxil));
-                    tracing::warn!(error = %e, ?shaders, wave_lanes = ?lanes, "host pipeline refused");
+                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -1159,51 +1064,12 @@ fn root_signature(
     }
 }
 
-/// The wave lanes (minimum, maximum) a compute DXIL container asks of the
-/// host in its pipeline state validation part (`PSV0`: after the 16 bytes of
-/// the stage's own information), when it asks for any: a host whose waves
-/// are narrower refuses the pipeline.
-fn wave_lanes(dxil: &[u8]) -> Option<(u32, u32)> {
-    let word = |at: usize| dxil.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-    let parts = word(28)? as usize;
-    for i in 0..parts {
-        let at = word(32 + 4 * i)? as usize;
-        if dxil.get(at..at + 4)? == b"PSV0" {
-            // part: tag, size; data: the size of the runtime info, then it
-            let info = at + 12;
-            let (min, max) = (word(info + 16)?, word(info + 20)?);
-            return (min != 0 || max != 0).then_some((min, max));
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
 
     use super::*;
-
-    /// Whether `device` runs on a software adapter (WARP, or the basic render driver of a runner
-    /// without a card): its adapter, found by LUID, is flagged software or is Microsoft's.
-    fn on_warp(device: &ID3D12Device) -> bool {
-        use windows::Win32::Graphics::Dxgi::{
-            CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
-        };
-        const MICROSOFT: u32 = 0x1414;
-        // SAFETY: plain DXGI and device queries.
-        unsafe {
-            let luid = device.GetAdapterLuid();
-            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
-                return false;
-            };
-            let Ok(desc) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid).and_then(|a| a.GetDesc1()) else {
-                return false;
-            };
-            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || desc.VendorId == MICROSOFT
-        }
-    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
@@ -1355,11 +1221,6 @@ mod tests {
         };
         if !host.depth_bounds() {
             eprintln!("no host depth bounds support; skipped");
-            return;
-        }
-        // WARP (the CI runner has no card) reports the test supported and passes the draw anyway.
-        if on_warp(&host.device) {
-            eprintln!("depth bounds on the software adapter; skipped");
             return;
         }
         let Some(dxc) = dxc() else {

@@ -91,6 +91,11 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// Recorded for a one-shot decoration bake (`BAKING`): submission-time
+    /// refresh must wait for title memory to stop remapping
+    /// (`title_memory_reading`) instead of taking `no_wait()` /
+    /// `refresh_unlocked()` or the 30-frame partial-read throttle.
+    exact: std::sync::atomic::AtomicBool,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -269,10 +274,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    // An upload from title memory can have already used this view. Only
-    // a copy from the same GPU source can satisfy this read.
-    list.first_use(placed as usize);
-    let new_source = list.alias_source_changed(to, from);
+    let first = list.first_use(placed as usize);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -287,7 +289,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !new_source && before.is_none() {
+    if !first && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);
@@ -470,6 +472,10 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
 /// bytes.
 static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+pub(crate) fn live_staging_bytes() -> u64 {
+    STAGED[1].load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Drop for Staging {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -508,32 +514,72 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// them, 2.1 GB, at the end of run 24). The next list that samples such a
 /// texture makes a staging buffer anew, detiles and uploads once more.
 /// Called before a submission starts, by the thread that submits.
+const SEVERE_HOST_RAM_BYTES: u64 = 1_000 * 1024 * 1024;
+
+/// Effective `(idle_ms, idle_frames, emergency_ram)` for texture staging cleanup:
+/// - `< 1,000 MiB` free physical RAM / headroom: immediate purge (`0 ms`, `1 frame`) of
+///   every staging buffer held by no command list (`Arc::strong_count == 1`).
+/// - `< 1,500 MiB` free physical RAM / headroom: emergency purge (`<= 400 ms`, `1 frame`).
+/// - `>= 1,500 MiB`: normal `base_idle_ms`, `4 frames`.
+fn staging_idle_policy_for(avail_phys: Option<u64>, headroom: Option<u64>, base_idle_ms: u64) -> (u64, u64, bool) {
+    const IDLE_FRAMES: u64 = 4;
+    let effective = match (avail_phys, headroom) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    if effective.is_some_and(|avail| avail < SEVERE_HOST_RAM_BYTES) {
+        (0, 1, true)
+    } else if effective.is_some_and(|avail| avail < crate::host::CRITICAL_HOST_RAM_BYTES) {
+        (base_idle_ms.min(400), 1, true)
+    } else {
+        (base_idle_ms, IDLE_FRAMES, false)
+    }
+}
+
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(map) = map.as_mut() else {
-        return;
-    };
-    if map.is_empty() {
-        return;
-    }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-    // A list that recorded an upload or a check holds the staging until it
-    // is reset: one only the table holds is named by no list, recorded or
-    // running.
-    let (mut went, mut bytes) = (0u64, 0u64);
-    map.retain(|_, s| {
-        let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
-        if !keep {
-            LET_GO[0].fetch_add(1, Relaxed);
-            LET_GO[1].fetch_add(s.bytes, Relaxed);
-            went += 1;
-            bytes += s.bytes;
+    // Sample live physical RAM outside `STAGING`'s lock so `< 1,500 MiB` reacts
+    // immediately instead of waiting on a delayed `residency::headroom()` sample.
+    let avail_phys = crate::host::available_physical_ram();
+    let headroom = crate::residency::headroom();
+    let (idle_ms, idle_frames, emergency_ram) =
+        staging_idle_policy_for(avail_phys, headroom, crate::host::ram_idle_ms(avail_phys));
+    let mut dropped: Vec<Arc<Staging>> = Vec::new();
+    let mut bytes = 0u64;
+    {
+        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = map.as_mut() else {
+            return;
+        };
+        if map.is_empty() {
+            return;
         }
-        keep
-    });
+        // A list that recorded an upload or a check holds the staging until it
+        // is reset: one only the table holds is named by no list, recorded or
+        // running.
+        let evict: Vec<usize> = map
+            .iter()
+            .filter(|(_, s)| {
+                Arc::strong_count(s) == 1
+                    && crate::host::long_ago(s.used.load(Relaxed), idle_ms, idle_frames)
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        for key in evict {
+            if let Some(s) = map.remove(&key) {
+                LET_GO[0].fetch_add(1, Relaxed);
+                LET_GO[1].fetch_add(s.bytes, Relaxed);
+                bytes += s.bytes;
+                dropped.push(s);
+            }
+        }
+        if emergency_ram && map.capacity() > map.len().saturating_mul(4).max(64) {
+            map.shrink_to_fit();
+        }
+    }
+    let went = dropped.len() as u64;
+    // Drop outside `STAGING`'s lock to return system RAM immediately without contention.
+    drop(dropped);
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }
@@ -755,6 +801,10 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         return;
     };
     use std::sync::atomic::Ordering::Relaxed;
+    let baking = BAKING.get();
+    if baking {
+        staging.exact.store(true, Relaxed);
+    }
     let picking = PICKING.get();
     if picking.is_none() {
         // A draw samples it through a table: kept and checked from here on.
@@ -809,8 +859,10 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // The host texture has the staging buffer's contents: only the check
     // at submission is left, and what it finds changed the next list that
     // samples the texture uploads (a frame late where every list of the
-    // frame was recorded before that check).
-    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+    // frame was recorded before that check). During a one-shot bake we
+    // always record the copy so any change found at submission lands in
+    // VRAM before the bake draw executes.
+    if !baking && staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging);
@@ -1253,12 +1305,13 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
+        let exact = self.exact.swap(false, std::sync::atomic::Ordering::Relaxed);
         let alone = self.once.load(std::sync::atomic::Ordering::Relaxed);
-        if alone && last.hash.is_some() {
+        if alone && !exact && last.hash.is_some() {
             return 0;
         }
         if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            if !exact && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
             last.asked = now;
@@ -1302,7 +1355,7 @@ impl Staging {
                 last.hot_until = frame + HOT_FRAMES;
             }
             let hot = hot_textures() && frame < last.hot_until;
-            if unwritten && !turn && !hot {
+            if !exact && unwritten && !turn && !hot {
                 return 0;
             }
             blind = unwritten;
@@ -1321,7 +1374,7 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let _mapped = if no_wait() && !exact {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
@@ -1341,7 +1394,7 @@ impl Staging {
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            if !exact && last.partial.is_some_and(|at| frame < at + 30) {
                 return 0;
             }
             last.partial = Some(frame);
@@ -1877,6 +1930,13 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let (piece, buffer, base, data) = match crate::pool::staging(host, total) {
         Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
         None => {
+            let speculative = PICKING.get().is_some() && !BAKING.get();
+            if crate::residency::upload_refused()
+                || (speculative && !crate::residency::allow_staging_growth(false))
+            {
+                crate::residency::note_staging_deferred();
+                return None;
+            }
             let (buffer, data) = host.upload_buffer(total)?;
             crate::host::name(&buffer, || {
                 format!(
@@ -1918,6 +1978,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
@@ -1926,6 +1987,20 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn staging_idle_policy_activates_emergency_purge_below_1500_and_1000_mib() {
+        const MIB: u64 = 1024 * 1024;
+        // Normal RAM (>= 1,500 MiB): preserves 4-frame grace and caller idle_ms.
+        assert_eq!(super::staging_idle_policy_for(Some(4_000 * MIB), Some(4_000 * MIB), 6_000), (6_000, 4, false));
+        assert_eq!(super::staging_idle_policy_for(Some(1_500 * MIB), Some(2_000 * MIB), 1_500), (1_500, 4, false));
+        // Live physical RAM < 1,500 MiB triggers emergency mode (<= 400 ms, 1 frame) even if cached headroom is stale/high.
+        assert_eq!(super::staging_idle_policy_for(Some(1_499 * MIB), Some(4_000 * MIB), 400), (400, 1, true));
+        assert_eq!(super::staging_idle_policy_for(Some(1_200 * MIB), Some(4_000 * MIB), 1_500), (400, 1, true));
+        // Severe physical RAM < 1,000 MiB (e.g. 82 MiB incident) purges immediately (0 ms, 1 frame).
+        assert_eq!(super::staging_idle_policy_for(Some(999 * MIB), Some(4_000 * MIB), 400), (0, 1, true));
+        assert_eq!(super::staging_idle_policy_for(Some(82 * MIB), Some(4_000 * MIB), 400), (0, 1, true));
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
@@ -2139,7 +2214,7 @@ mod allocation_costs {
                 seen.push(digest(&bytes));
             }
         }
-        let text: Vec<u8> = (0..400u32).map(|i| ((i * 37) >> 2) as u8).collect();
+        let text: Vec<u8> = (0..400u32).map(|i| (i * 37 >> 2) as u8).collect();
         for at in 0..399 {
             let mut bytes = text.clone();
             bytes.swap(at, at + 1);

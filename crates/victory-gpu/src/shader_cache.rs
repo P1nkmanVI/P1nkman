@@ -67,12 +67,6 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
-            "VICTORY_GUARDED_DESCRIPTORS",
-            "VICTORY_WAVE_WIDE_FOR",
-            "VICTORY_WAVE_EARLY_OUTS",
-            "VICTORY_WAVE_SELECTIVE_SKIPS",
-            "VICTORY_WAVE_EARLY_OUTS_EXCHANGE",
-            "VICTORY_WAVE_ATOMICS",
             "VICTORY_F16_NEAREST",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
@@ -81,8 +75,6 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
-            // Whether the ray-tracing node test always misses.
-            "VICTORY_RT_MISS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -123,33 +115,11 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| {
-        victory_shader::emit::with_wide_first(wide_first(c), || victory_shader::emit::translate(c)).map_err(|e| e.to_string())
-    };
+    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
     }
-}
-
-/// Whether `container` is one of the programs named in `VICTORY_WAVE_WIDE_FOR` (hashes as the
-/// log names shaders, or their beginnings, separated by commas): those take the exact wave-wide
-/// form before the approximate ones (`victory_shader::emit::with_wide_first`).
-fn wide_first(container: &[u8]) -> bool {
-    static FOR: OnceLock<Vec<String>> = OnceLock::new();
-    let named = FOR.get_or_init(|| {
-        std::env::var("VICTORY_WAVE_WIDE_FOR")
-            .unwrap_or_default()
-            .split(',')
-            .map(|h| h.trim().to_lowercase())
-            .filter(|h| !h.is_empty())
-            .collect()
-    });
-    if named.is_empty() {
-        return false;
-    }
-    let hash = blake3::hash(container).to_hex();
-    named.iter().any(|h| hash.starts_with(h.as_str()))
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -297,11 +267,6 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
-    word(&mut out, s.half_views.len() as u32);
-    for &(slot, dword) in &s.half_views {
-        word(&mut out, u32::from(slot));
-        word(&mut out, dword);
-    }
     out
 }
 
@@ -370,11 +335,6 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
-    let n = r.word()? as usize;
-    let mut half_views = Vec::with_capacity(n.min(256));
-    for _ in 0..n {
-        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
-    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -385,7 +345,6 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
-        half_views,
     })
 }
 
@@ -420,7 +379,6 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
-            half_views: vec![(0, 8), (4, 0)],
         }
     }
 

@@ -109,6 +109,7 @@ pub(crate) fn start(device: &ID3D12Device, wanted: impl Fn() -> bool + Send + 's
     let thread = std::thread::Builder::new()
         .name("victory-card-awake".into())
         .spawn(move || {
+            crate::cores::keep_background_thread("victory-card-awake");
             if let Err(e) = run(&device, &wanted, &ended) {
                 tracing::warn!(error = %e, "the card is not kept awake");
             }

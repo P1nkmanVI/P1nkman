@@ -46,6 +46,16 @@ impl Title {
 /// Every number once, whatever the count and the threads, batch after batch
 /// and from several callers.
 #[test]
+fn default_threads_scales_for_six_core_cpus() {
+    assert_eq!(default_threads(1), 1);
+    assert_eq!(default_threads(2), 2);
+    assert_eq!(default_threads(4), 2);
+    assert_eq!(default_threads(6), 3);
+    assert_eq!(default_threads(8), 4);
+    assert_eq!(default_threads(16), 4);
+}
+
+#[test]
 fn the_pool_calls_every_number_once() {
     for threads in [1usize, 2, 4, 7] {
         let pool = Pool::new("victory-land", threads);
@@ -293,7 +303,7 @@ fn landings_beside_the_title_and_its_refreshes_lose_nothing() {
                     while !stop.load(Ordering::Relaxed) {
                         // Its own dwords, in every other block (in the rest
                         // only landings change anything).
-                        for i in (w..LEN / 4).step_by(4 * 97).filter(|i| (i * 4 / BLOCK).is_multiple_of(2)) {
+                        for i in (w..LEN / 4).step_by(4 * 97).filter(|i| i * 4 / BLOCK % 2 == 0) {
                             assert_eq!(dword(i).swap(value, Ordering::Relaxed), value - 1, "dword {i}: undone");
                         }
                         value += 1;
@@ -343,7 +353,7 @@ fn landings_beside_the_title_and_its_refreshes_lose_nothing() {
         stop.store(true, Ordering::Relaxed);
         for (w, writer) in writers.into_iter().enumerate() {
             let last = writer.join().expect("nothing undone");
-            for i in (w..LEN / 4).step_by(4 * 97).filter(|i| (i * 4 / BLOCK).is_multiple_of(2)) {
+            for i in (w..LEN / 4).step_by(4 * 97).filter(|i| i * 4 / BLOCK % 2 == 0) {
                 assert_eq!(dword(i).load(Ordering::Relaxed), last);
             }
         }
