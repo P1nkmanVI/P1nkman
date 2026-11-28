@@ -2,11 +2,12 @@
 //! what it cannot handle yet is tallied (decision 0003).
 
 use std::collections::{BTreeMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
@@ -239,17 +240,35 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    host_wave: Option<u32>,
 ) -> Result<()> {
-    // Dumped shaders and validator reports are game-derived (rule #1).
-    if let Some(dir) = std::env::var_os("VICTORY_EMIT_DUMP") {
-        victory_core::ensure_outside_repo(Path::new(&dir))?;
+    // Every dump below contains game-derived shader data (rule #1). Validate
+    // all destinations before worker threads start, so a typo cannot put it
+    // in the repository and a bad path cannot silently lose diagnostics.
+    for name in ["VICTORY_EMIT_DUMP", "VICTORY_FAIL_DUMP"] {
+        if let Some(dir) = std::env::var_os(name) {
+            prepare_dump_dir(name, Path::new(&dir))?;
+        }
+    }
+    if let Some(file) = std::env::var_os("VICTORY_SHADER_CENSUS") {
+        prepare_output_file("VICTORY_SHADER_CENSUS", Path::new(&file))?;
+    }
+    if let Ok(spec) = std::env::var("VICTORY_DUMP_MATCH") {
+        let (dir, _) = spec.split_once(';').ok_or_else(|| {
+            anyhow::anyhow!("VICTORY_DUMP_MATCH must be <directory>;<text>|<text>")
+        })?;
+        anyhow::ensure!(!dir.is_empty(), "VICTORY_DUMP_MATCH directory is empty");
+        prepare_dump_dir("VICTORY_DUMP_MATCH", Path::new(dir))?;
     }
     let paths = crate::default_paths(paths)?;
-    // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
-    // at most 32 lanes (as the runtime does on such a card).
-    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
+    // Match the runtime's D3D12_OPTIONS1 wave-width choice when supplied.
+    if let Some(n) = host_wave {
         victory_shader::emit::set_host_max_wave(n);
     }
+    println!(
+        "host wave max {} lanes (0 = not specified)",
+        victory_shader::emit::host_settings()[0]
+    );
     // `VICTORY_HOST_RDNA=1`: as for an AMD RDNA card (`VICTORY_RDNA_FLOAT`).
     victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").is_some_and(|v| v == "1"));
     let dll = validate.then(Validator::default_path).flatten();
@@ -501,7 +520,10 @@ fn translate(
         && let Some((dir, texts)) = spec.split_once(';')
     {
         let line = example();
-        if texts.split('|').any(|text| !text.is_empty() && line.contains(text)) {
+        if texts
+            .split('|')
+            .any(|text| !text.is_empty() && line.contains(text))
+        {
             let name: String = source
                 .label()
                 .chars()
@@ -509,8 +531,13 @@ fn translate(
                 .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
                 .take(70)
                 .collect();
-            let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
+            let path = std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil"));
+            if let Err(error) = write_dump_once(&path, &bytes) {
+                eprintln!(
+                    "warning: cannot write VICTORY_DUMP_MATCH file {}: {error}",
+                    path.display()
+                );
+            }
         }
     }
     if !lock(seen).insert(code) {
@@ -527,18 +554,93 @@ fn translate(
     // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
-    let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
+    let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| {
+        t.failed
+            .iter()
+            .map(|(reason, (count, _))| (reason.clone(), *count))
+            .collect()
+    });
     translate_programs(&container, programs, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
-        for (reason, (n, _)) in &t.failed {
-            let was = before.get(reason).copied().unwrap_or(0);
-            if *n > was && was < 3 {
-                let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
-                let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
+        for (reason, (count, _)) in &t.failed {
+            if *count > before.get(reason).copied().unwrap_or(0)
+                && let Err(error) = write_failed_dump(Path::new(&dir), reason, &hash, &bytes)
+            {
+                eprintln!("warning: cannot write VICTORY_FAIL_DUMP file for {hash}: {error:#}");
             }
         }
     }
+}
+
+fn prepare_dump_dir(name: &str, dir: &Path) -> Result<()> {
+    victory_core::ensure_outside_repo(dir).with_context(|| {
+        format!(
+            "{name} must point outside the repository: {}",
+            dir.display()
+        )
+    })?;
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("cannot create {name} directory {}", dir.display()))
+}
+
+fn prepare_output_file(name: &str, file: &Path) -> Result<()> {
+    victory_core::ensure_outside_repo(file).with_context(|| {
+        format!(
+            "{name} must point outside the repository: {}",
+            file.display()
+        )
+    })?;
+    if let Some(parent) = file.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {name} directory {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+/// Write one diagnostic container without replacing an earlier capture.
+fn write_dump_once(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("opening {}", path.display())),
+    };
+    if let Err(error) = file.write_all(bytes) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error).with_context(|| format!("writing {}", path.display()));
+    }
+    Ok(true)
+}
+
+/// At most three unique failed containers per reason, across all workers.
+fn write_failed_dump(dir: &Path, reason: &str, hash: &str, bytes: &[u8]) -> Result<()> {
+    static DUMPED: std::sync::OnceLock<Mutex<BTreeMap<String, usize>>> = std::sync::OnceLock::new();
+    static RUN_ID: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    let run_id = *RUN_ID.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos())
+    });
+    let mut counts = lock(DUMPED.get_or_init(|| Mutex::new(BTreeMap::new())));
+    let index = counts.entry(reason.to_owned()).or_default();
+    if *index >= 3 {
+        return Ok(());
+    }
+    let n = *index;
+    *index += 1;
+    let stem: String = reason
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .take(48)
+        .collect();
+    let path = dir.join(format!("{stem}_{hash}_{run_id}_{n}.cdxil"));
+    drop(counts);
+    write_dump_once(&path, bytes)?;
+    Ok(())
 }
 
 fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
@@ -640,8 +742,16 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
     static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     let Some(out) = OUT.get_or_init(|| {
         let path = std::env::var_os("VICTORY_SHADER_CENSUS")?;
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
-        Some(Mutex::new(file))
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => Some(Mutex::new(file)),
+            Err(error) => {
+                eprintln!(
+                    "warning: cannot open VICTORY_SHADER_CENSUS file {}: {error}",
+                    Path::new(&path).display()
+                );
+                None
+            }
+        }
     }) else {
         return;
     };
@@ -672,7 +782,12 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
         line.push_str(&format!("\t{name}={n}"));
     }
     line.push('\n');
-    let _ = lock(out).write_all(line.as_bytes());
+    if let Err(error) = lock(out).write_all(line.as_bytes()) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!("warning: cannot write VICTORY_SHADER_CENSUS record: {error}");
+        }
+    }
 }
 
 /// Validates an emitted shader if asked to.
@@ -699,10 +814,17 @@ fn check(
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
-        let _ = std::fs::write(
-            format!("{dir}/{}.dxil", &name[name.len().saturating_sub(100)..]),
-            &shader.dxil,
-        );
+        let hash = blake3::hash(&shader.dxil).to_hex()[..16].to_owned();
+        let path = Path::new(&dir).join(format!(
+            "{}_{hash}.dxil",
+            &name[name.len().saturating_sub(100)..]
+        ));
+        if let Err(error) = write_dump_once(&path, &shader.dxil) {
+            eprintln!(
+                "warning: cannot write VICTORY_EMIT_DUMP file {}: {error}",
+                path.display()
+            );
+        }
     }
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {
@@ -943,21 +1065,56 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    /// Shader dumps are game-derived, so a dump directory in the repo is refused.
+    /// Every shader dump option is game-derived and must stay out of the repo.
     #[test]
-    fn emit_dump_inside_repo_is_refused() {
-        // SAFETY: no other test in this binary touches the environment.
-        unsafe { std::env::set_var("VICTORY_EMIT_DUMP", env!("CARGO_MANIFEST_DIR")) };
-        let missing = std::env::temp_dir().join("victory-translate-no-such-dir");
-        let err = super::run(vec![missing], false, false, false, Some(1)).unwrap_err();
-        // SAFETY: as above; unset so a later test's `run` is not refused.
-        unsafe { std::env::remove_var("VICTORY_EMIT_DUMP") };
-        assert!(
-            matches!(
-                err.downcast_ref(),
-                Some(victory_core::PolicyError::InsideRepo { .. })
-            ),
-            "{err}"
-        );
+    fn every_dump_option_inside_repo_is_refused() {
+        let repo = env!("CARGO_MANIFEST_DIR");
+        let options = [
+            ("VICTORY_EMIT_DUMP", repo.to_owned()),
+            ("VICTORY_FAIL_DUMP", repo.to_owned()),
+            ("VICTORY_SHADER_CENSUS", repo.to_owned()),
+            ("VICTORY_DUMP_MATCH", format!("{repo};sample")),
+        ];
+        for (name, value) in options {
+            // SAFETY: this test is the only code in this binary using these variables.
+            unsafe { std::env::set_var(name, value) };
+            let missing = std::env::temp_dir().join("victory-translate-no-such-dir");
+            let result = super::run(vec![missing], false, false, false, Some(1), None);
+            // SAFETY: unset immediately so later tests do not inherit the option.
+            unsafe { std::env::remove_var(name) };
+            let err = result.unwrap_err();
+            assert!(
+                matches!(
+                    err.downcast_ref(),
+                    Some(victory_core::PolicyError::InsideRepo { .. })
+                ),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_shader_dumps_are_unique_and_limited_across_workers() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("victory-dump-test-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let reason = format!("synthetic concurrent failure {nonce}");
+        std::thread::scope(|scope| {
+            for n in 0..12 {
+                let dir = &dir;
+                let reason = &reason;
+                scope.spawn(move || {
+                    super::write_failed_dump(dir, reason, &format!("{n:016x}"), b"synthetic")
+                        .unwrap();
+                });
+            }
+        });
+        let files = std::fs::read_dir(&dir).unwrap().count();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(files, 3, "one reason should keep only three dumps");
     }
 }

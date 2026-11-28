@@ -8837,11 +8837,9 @@ impl<'a> Lower<'a> {
                     // this lane's bit of it. Exact where host lanes are
                     // the console's.
                     None if self.mask_data == MaskData::Console => {
-                        // Each host wave taken as a wave of its own has no
-                        // console lane numbers to pick the bits by.
-                        if self.local {
-                            return Err("a constant lane mask in a half-wave");
-                        }
+                        // In the exact local-wave retry, `console_lane` maps each 32-lane
+                        // host wave back to its proved 0..63 console half. `lane_bit` then
+                        // selects the matching dword and bit without cross-wave exchange.
                         let m = mask.ok_or(UNTRACKED)?;
                         let lo = self.i32_of(m).map_err(|_| UNTRACKED)?;
                         // wave64: the register after it holds lanes 32-63.

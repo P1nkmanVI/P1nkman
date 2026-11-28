@@ -20,7 +20,7 @@ $settings = @{
     # The base: the title's own upscaler, 1080p, and the pipelines a run draws with written down
     # (`victory warm --used` makes them ahead of the next run).
     VICTORY_UPSCALER = '6'; VICTORY_MEMORY_CARD_MB = '1024'; VICTORY_DISPLAY_MODE = '1920x1080'
-    VICTORY_PIPELINE_BOOK = '1'; VICTORY_NO_WATCHDOG = '1'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
+    VICTORY_PIPELINE_BOOK = '1'; VICTORY_NO_WATCHDOG = '1'; VICTORY_D3D12_DRED = 'light'
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '0'
@@ -50,7 +50,7 @@ if (-not (Test-Path $victory)) { $victory = Join-Path $PSScriptRoot "..\target\$
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; return }
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; return }
 # (Other settings left over in this window go; where your files are stays.)
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
+$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_SHADER_SAVE', 'VICTORY_SHADER_SAVE_HASHES', 'VICTORY_WAVE_WHY'
 Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $Exe = (Resolve-Path $Exe).Path

@@ -28,12 +28,12 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 /// Bytes of a block; pieces of more than half of one are not pooled (with
 /// blocks made ahead, [`ahead`]: of more than one).
 const BLOCK: u64 = 64 << 20;
-/// Empty texture blocks to keep when card memory is under 85% used.
+/// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
-/// Empty texture blocks to keep while the card has room ([`room`]): 4 GiB.
+/// The same while the card has room ([`room`]): 4 GiB of them.
 const SPARE_KEPT: usize = 64;
-/// Empty staging blocks to keep: these are mapped system memory (128 MiB).
-/// Keep this small on 16 GiB PCs; the old value of eight retained 512 MiB.
+/// Empty staging blocks to keep: mapped system memory. Eight formerly kept
+/// 512 MiB.
 const STAGING_KEPT: usize = 2;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
@@ -45,10 +45,7 @@ static STAGING_SPARES: AtomicUsize = AtomicUsize::new(STAGING_KEPT);
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
-    STAGING_SPARES.store(
-        staging_spares(crate::host::available_physical_ram()),
-        Ordering::Relaxed,
-    );
+    STAGING_SPARES.store(staging_spares(crate::host::available_physical_ram()), Ordering::Relaxed);
     // Drop empty mapped upload blocks after the 2.5 s safety rest. Active
     // pieces remain owned by their textures or command lists.
     lock(&STAGING).rested(now());

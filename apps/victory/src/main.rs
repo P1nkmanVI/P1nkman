@@ -86,6 +86,10 @@ enum Command {
         /// Also create a host D3D12 pipeline for each emitted shader.
         #[arg(long)]
         pipelines: bool,
+        /// Translate for a host GPU whose maximum wave width is 32 or 64 lanes.
+        /// Overrides VICTORY_HOST_MAX_WAVE and VICTORY_HOST_WAVE for this command.
+        #[arg(long, value_parser = parse_host_wave)]
+        host_wave: Option<u32>,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
@@ -171,6 +175,13 @@ enum Console {
     SeriesS,
 }
 
+fn parse_host_wave(value: &str) -> std::result::Result<u32, String> {
+    match value.parse::<u32>() {
+        Ok(width @ (32 | 64)) => Ok(width),
+        _ => Err("wave width must be 32 or 64".into()),
+    }
+}
+
 fn main() -> Result<()> {
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
@@ -200,6 +211,7 @@ fn main() -> Result<()> {
             paths,
             validate,
             pipelines,
+            host_wave,
             list,
             jobs,
             warm,
@@ -208,14 +220,25 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
             }
-            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
-            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+            // The explicit command option wins over the older environment settings.
+            let host_wave = host_wave
+                .or_else(|| {
+                    std::env::var("VICTORY_HOST_MAX_WAVE")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                })
+                .or_else(|| {
+                    std::env::var("VICTORY_HOST_WAVE")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                });
+            if let Some(n) = host_wave {
                 victory_shader::emit::set_host_max_wave(n);
             }
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            translate::run(paths, validate, pipelines, list, jobs, host_wave)
         }
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]

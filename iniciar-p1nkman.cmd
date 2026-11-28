@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
+if exist "%~dp0iniciar-p1nkman.local.cmd" call "%~dp0iniciar-p1nkman.local.cmd"
 if not defined VICTORY_GAME_DIR set "VICTORY_GAME_DIR=C:\Jogos\MeuJogo"
 set "VICTORY_DATA_DIR=%LOCALAPPDATA%\P1nkman-Coolfox\data"
 set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\P1nkman-Coolfox\cache"
@@ -17,7 +18,7 @@ if exist "%VICTORY_DATA_DIR%\7952987A\saves" (
 )
 set "P1_LOG=%P1_LOG_DIR%\p1nkman-%STAMP%.log"
 echo P1nkman - perfil Series S. Log: %P1_LOG%
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\play.ps1" -Exe "%VICTORY_GAME_DIR%\game_scarlett_master.exe" -Build release > "%P1_LOG%" 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\capture-session.ps1" -Exe "%VICTORY_GAME_DIR%\game_scarlett_master.exe" -Build release -Console series-s -MaxMinutes 15 -MinFreeGiB 5 > "%P1_LOG%" 2>&1
 set "P1_CODE=%ERRORLEVEL%"
 echo Encerrado com codigo %P1_CODE%. Log: %P1_LOG%
 pause
