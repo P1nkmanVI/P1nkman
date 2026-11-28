@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::Interface;
 
 use super::Staging;
@@ -192,6 +193,7 @@ struct Worker {
     allocator: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
+    event: windows::Win32::Foundation::HANDLE,
 }
 
 // SAFETY: a worker's objects are its thread's own; the queue is free-threaded.
@@ -205,7 +207,8 @@ impl Worker {
             let list: ID3D12GraphicsCommandList =
                 device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
             list.Close()?;
-            Ok(Worker { queue, allocator, list, fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)? })
+            let event = CreateEventW(None, false, false, None)?;
+            Ok(Worker { queue, allocator, list, fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?, event })
         }
     }
 
@@ -229,6 +232,19 @@ impl Worker {
             value += 1;
             if let Err(e) = self.copy(&jobs, value) {
                 tracing::warn!(error = %e, "uploads ahead did not run");
+                // Do not tell waiting descriptor flips that failed or
+                // incomplete copies are ready. Leave them pending so the
+                // normal list upload path can serve them on a later pass.
+                for job in &jobs {
+                    job.copy.ahead.store(NONE, Relaxed);
+                    job.staging.dirty.store(true, Relaxed);
+                }
+                {
+                    let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+                    way.retain(|(serial, _)| !jobs.iter().any(|job| job.copy.serial == *serial));
+                    LANDED.notify_all();
+                }
+                continue;
             }
             finish(jobs);
         }
@@ -249,8 +265,10 @@ impl Worker {
             self.list.Close()?;
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
             self.queue.Signal(&self.fence, value)?;
-            // (Without an event: this waits.)
-            self.fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;
+            if self.fence.GetCompletedValue() < value {
+                self.fence.SetEventOnCompletion(value, self.event)?;
+                WaitForSingleObject(self.event, INFINITE);
+            }
         }
         Ok(())
     }
